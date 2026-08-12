@@ -104,7 +104,10 @@ async function recreate(db) {
 /** Run the real migration entry point against `db`. Returns its stdout. */
 function migrate(db) {
   return execFileSync(process.execPath, [MIGRATE_JS], {
-    env: { ...process.env, DATABASE_URL: urlFor(db) },
+    // Pinned, not inherited — see the note in rls-security-verify.js. An
+    // inherited MIGRATION_DATABASE_URL comes from .env and points at the
+    // real database, which is not what a bootstrap verification should touch.
+    env: { ...process.env, DATABASE_URL: urlFor(db), MIGRATION_DATABASE_URL: urlFor(db) },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 15 * 60 * 1000,

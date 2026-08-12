@@ -353,7 +353,14 @@ async function insertStatementFor(admin, table, orgId, ctx) {
     }
     await a.end();
     execFileSync(process.execPath, [MIGRATE_JS], {
-      env: { ...process.env, DATABASE_URL: urlFor(DB) }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      // MIGRATION_DATABASE_URL is pinned to THIS harness's own database, not
+      // inherited. Inheriting it meant dotenv's value came along — and .env
+      // is where a production URL lives — so a local RLS run migrated
+      // Supabase instead of its own scratch database. migrate.js now refuses
+      // a remote target anyway, which would fail this harness rather than
+      // fix it; being explicit is what actually keeps it working.
+      env: { ...process.env, DATABASE_URL: urlFor(DB), MIGRATION_DATABASE_URL: urlFor(DB) },
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 15 * 60 * 1000,
     });
     emit('  migrations applied');

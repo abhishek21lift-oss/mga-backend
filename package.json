@@ -21,6 +21,7 @@
     "worker:all": "node src/workers/index.js",
     "lint": "eslint .",
     "migrate": "node src/db/migrate.js",
+  "migrate:remote": "node scripts/migrate-remote.js",
     "verify:smtp": "node scripts/verify-smtp.js",
     "test": "NODE_OPTIONS=--experimental-vm-modules jest --forceExit --detectOpenHandles",
     "diagnose:redis": "node --require ./diagnostics/redis-trace.js src/server.js",

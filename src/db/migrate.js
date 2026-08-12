@@ -6,6 +6,25 @@
 //   2. Module: require('./migrate').runMigrations()  (pool stays open)
 //              Called automatically from server.js on startup.
 
+// ── Read before anything else in this file ──────────────────────────────────
+//
+// Captured HERE, above the requires, because ./pool calls dotenv.config() on
+// import. From the line below onwards, .env has been merged into process.env
+// and there is no way left to tell a value the operator typed from a value a
+// local file supplied.
+//
+// That distinction is the whole point. .env is local developer configuration;
+// it is also where a production MIGRATION_DATABASE_URL naturally ends up, and
+// server.js runs runMigrationsWithRetry() on every boot. The combination meant
+// `npm run dev` on a laptop migrated the production database — not as an edge
+// case but as the default, and it is how migration 162 reached Supabase
+// without anyone deciding it should.
+//
+// So the escape hatch is deliberately NOT readable from .env. Adding
+// MIGRATION_ALLOW_REMOTE=1 to that file does nothing; it has to be supplied on
+// the command line, which is a thing a person does on purpose.
+const ALLOW_REMOTE = process.env.MIGRATION_ALLOW_REMOTE === '1';
+
 const fs   = require('fs');
 const path = require('path');
 const pool = require('./pool');
@@ -33,6 +52,61 @@ const pool = require('./pool');
  * schema migration is a platform operation with no tenant to scope it to.
  */
 const MIGRATION_URL = process.env.MIGRATION_DATABASE_URL || null;
+
+/**
+ * Hosts that cannot be somebody else's database. Everything else is remote,
+ * including a private IP — a colleague's machine on the same network is still
+ * not this machine.
+ */
+const LOCAL_HOSTS = new Set([
+  'localhost', '127.0.0.1', '::1', '0.0.0.0', 'host.docker.internal', 'postgres', 'db',
+]);
+
+const hostOf = (url) => { try { return new URL(url).hostname; } catch { return null; } };
+
+/**
+ * Refuse to migrate a database this command was not obviously meant to touch.
+ *
+ * Deliberately not a check on "is this Supabase" or "is this production" —
+ * neither is knowable from a URL, and a rule that guesses is a rule that is
+ * wrong on the day it matters. The question asked instead is answerable:
+ * is the target on this machine, and if not, did a human say so?
+ *
+ * Three ways through, in the order they are asked:
+ *
+ *   · the target is local            — nothing to protect
+ *   · NODE_ENV=production            — a deploy migrating its own database is
+ *                                      the entire point, and Render sets this
+ *   · MIGRATION_ALLOW_REMOTE=1       — supplied on the command line, above
+ *
+ * Everything else stops. The message names the host so the mistake is obvious,
+ * and never the URL, which carries the password.
+ */
+function assertTargetIsIntentional() {
+  const url = MIGRATION_URL || process.env.DATABASE_URL || '';
+  const host = hostOf(url);
+
+  if (!host) return;                              // nothing resolvable to judge
+  if (LOCAL_HOSTS.has(host)) return;
+  if (process.env.NODE_ENV === 'production') return;
+  if (ALLOW_REMOTE) return;
+
+  const via = MIGRATION_URL ? 'MIGRATION_DATABASE_URL' : 'DATABASE_URL';
+  const err = new Error(
+    `refusing to migrate a remote database from a non-production process.\n`
+    + `    target : ${host}  (via ${via})\n`
+    + `    reason : NODE_ENV is ${process.env.NODE_ENV || 'unset'}, and this host is not local.\n`
+    + `             .env is developer configuration and server.js migrates on boot, so a\n`
+    + `             production URL there would be applied by \`npm run dev\`.\n`
+    + `    fix    : point ${via} at a local database, or if you really mean this one:\n`
+    + `             npm run migrate:remote        (asks for confirmation)\n`
+    + `             MIGRATION_ALLOW_REMOTE=1 node src/db/migrate.js\n`
+    + `             Setting MIGRATION_ALLOW_REMOTE in .env has no effect, by design.`,
+  );
+  // Retrying a refusal five times helps nobody and buries the message.
+  err.isSafetyRefusal = true;
+  throw err;
+}
 
 function migrationPool() {
   if (!MIGRATION_URL) return { pool, release: () => {} };
@@ -167,6 +241,9 @@ async function clearStaleLock(client) {
 }
 
 async function runMigrations() {
+  // Before a connection is opened, let alone a statement run.
+  assertTargetIsIntentional();
+
   const { pool: mpool, release: releasePool } = migrationPool();
   if (MIGRATION_URL) console.log('  · migrating via MIGRATION_DATABASE_URL (privileged role)');
   const client = await mpool.connect();
@@ -263,6 +340,9 @@ async function runMigrationsWithRetry({ attempts = 5, baseDelayMs = 2000 } = {})
       return;
     } catch (err) {
       lastErr = err;
+      // A refusal is a decision, not a transient fault. Retrying it four more
+      // times only pushes the explanation off the top of the log.
+      if (err.isSafetyRefusal) throw err;
       console.error(`  ⚠ migration attempt ${attempt}/${attempts} failed: ${err.message}`);
       if (attempt === attempts) break;
       const delay = baseDelayMs * 2 ** (attempt - 1); // 2s, 4s, 8s, 16s
