@@ -103,9 +103,33 @@ END $$;
 --
 -- Dropped, leaving the unconditional deny added above.
 DROP POLICY IF EXISTS biometric_attendance_member_policy  ON public.biometric_attendance;
-DROP POLICY IF EXISTS gym_settings_admin_policy           ON public.gym_settings;
 DROP POLICY IF EXISTS webauthn_challenges_member_policy   ON public.webauthn_challenges;
 DROP POLICY IF EXISTS webauthn_credentials_member_policy  ON public.webauthn_credentials;
+
+-- gym_settings is guarded; the three above are not, and the difference is not
+-- an inconsistency. Those three are created by migrations in this repository,
+-- so on any database that reaches this file they exist. gym_settings is not
+-- created by any tracked migration — it exists on the original production
+-- database only because it was made out of band — and DROP POLICY IF EXISTS
+-- still errors when the TABLE is missing. `IF EXISTS` guards the policy, not
+-- the relation.
+--
+-- Migration 101 hit exactly this and solved it this way; 148 documents the
+-- same trap. This file missed it, which nothing noticed because every database
+-- it had ever run against descended from one where the table existed. On a
+-- genuinely fresh database it aborts the whole chain here:
+--
+--     ✗ 131_close_rls_gaps.sql FAILED: relation "public.gym_settings" does not exist
+--
+-- Found against Supabase PostgreSQL 17.6. Note that a later 17.x makes the
+-- bare statement tolerant of a missing relation, which is why CI on a newer
+-- minor had been passing this file — see DATABASE-BOOTSTRAP.md on pinning the
+-- verification image to the version production actually runs.
+DO $$ BEGIN
+  IF to_regclass('public.gym_settings') IS NOT NULL THEN
+    DROP POLICY IF EXISTS gym_settings_admin_policy ON public.gym_settings;
+  END IF;
+END $$;
 
 -- Future tables created by a superuser default to no grants, but Supabase
 -- ships default privileges that can re-grant to anon. Strip them so a
