@@ -221,6 +221,18 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # /api/health is 503 without Redis, and the enforcement step below
+      # probes it.
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -234,3 +246,48 @@ jobs:
 
       - name: Verify tenant isolation as app_tenant
         run: node scripts/rls-security-verify.js
+
+      # Enforcement readiness (Phase 5B part H/J).
+      #
+      # Everything above proves the policies work when a non-bypassing role
+      # queries the database directly. It does not prove the *application* can
+      # run that way, and that is the step TENANT-RLS-PLAN.md warns is the one
+      # that "finds what the app quietly relied on". Booting the real server as
+      # app_tenant with TENANT_RLS_ENFORCE=on is how that gets found here
+      # rather than on a staging cutover.
+      #
+      # Staging only. Nothing about this touches production.
+      - name: Boot as app_tenant with RLS enforcement on
+        env:
+          NODE_ENV: test
+          JWT_SECRET: ci-rls-enforce-secret-not-a-real-credential-00000
+          FRONTEND_URL: http://localhost:3000
+          REDIS_URL: redis://localhost:6379
+          PORT: '5001'
+          RUN_WORKERS: '0'
+          TENANT_RLS_ENFORCE: 'on'
+        run: |
+          set -o pipefail
+          PW=$(node -e "console.log(require('crypto').randomBytes(18).toString('hex'))")
+          PGPASSWORD=postgres psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE app_tenant WITH LOGIN PASSWORD '$PW'"
+          export DATABASE_URL="postgresql://app_tenant:$PW@localhost:5432/mga_rls_test?sslmode=disable"
+
+          node src/server.js > /tmp/enforce.log 2>&1 & echo $! > /tmp/enforce.pid
+          for i in $(seq 1 45); do
+            body=$(curl -fsS --max-time 5 http://127.0.0.1:5001/api/health 2>/dev/null) && {
+              echo "healthy as app_tenant after ${i}s: $body"
+              {
+                echo "## Enforcement readiness"; echo
+                echo "Role: app_tenant (NOBYPASSRLS) · TENANT_RLS_ENFORCE=on"; echo
+                echo '```json'; echo "$body"; echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              kill "$(cat /tmp/enforce.pid)" 2>/dev/null || true
+              exit 0
+            }
+            sleep 1
+          done
+          echo "::error title=RLS enforcement::server did not become healthy as app_tenant with TENANT_RLS_ENFORCE=on"
+          tail -40 /tmp/enforce.log || true
+          kill "$(cat /tmp/enforce.pid)" 2>/dev/null || true
+          exit 1
