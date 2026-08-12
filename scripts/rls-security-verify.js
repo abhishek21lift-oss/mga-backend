@@ -354,7 +354,15 @@ async function synthesise(admin, table, orgId) {
   emit('  all checks passed');
   process.exit(0);
 })().catch((e) => {
-  console.error('\nHARNESS ERROR:', e.message);
+  // Surfaced as an annotation, not just logged: a thrown harness error and a
+  // real isolation failure both exit 1, and without the message in a
+  // token-readable place they are indistinguishable from outside the runner.
+  const detail = `${e.message}${e.code ? ` [${e.code}]` : ''}`;
+  console.error('\nHARNESS ERROR:', detail);
+  if (process.env.GITHUB_ACTIONS) console.log(`::error title=RLS harness::${detail}`);
+  if (e.stack && process.env.GITHUB_ACTIONS) {
+    console.log(`::error title=RLS harness::${e.stack.split('\n').slice(1, 4).join(' | ')}`);
+  }
   if (e.stdout) console.error(String(e.stdout).slice(-3000));
   process.exit(1);
 });
