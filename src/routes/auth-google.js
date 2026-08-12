@@ -61,8 +61,12 @@ router.post('/google-login', async (req, res) => {
         // organization_id is selected only so the login event carries studio
         // attribution; without it Google sign-ins would be invisible to the
         // Security Centre's per-studio filter. Nothing else here reads it.
+        // Via auth_user_by_email for the same reason primary login is: this
+        // runs before tenant context exists, so a direct read is hidden by
+        // RLS and every Google sign-in fails. See migration 160. The function
+        // already filters is_active and deleted_at.
         `SELECT id, name, email, role, token_version, trainer_id, member_id, is_active, organization_id
-           FROM users WHERE LOWER(email) = LOWER($1) AND is_active = true AND deleted_at IS NULL`,
+           FROM auth_user_by_email($1)`,
         [email]
       );
       user = rows[0];

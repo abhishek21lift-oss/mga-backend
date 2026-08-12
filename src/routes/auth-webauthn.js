@@ -393,7 +393,9 @@ router.post('/login/options', authnLimiter, withConfigCheck(async (req, res, nex
 
     if (email) {
       const { rows: users } = await pool.query(
-        `SELECT id FROM users WHERE LOWER(email) = $1 AND is_active = true AND deleted_at IS NULL`,
+        // Pre-auth: no tenant context yet, so a direct read finds nothing
+        // under RLS and passkey discovery silently returns no credentials.
+        `SELECT id FROM auth_user_by_email($1)`,
         [email]
       );
       if (users.length) {
@@ -487,8 +489,9 @@ router.post('/login/verify', authnLimiter, withConfigCheck(async (req, res, next
       // organization_id is selected only so the login event carries studio
       // attribution; without it passkey sign-ins would be invisible to the
       // Security Centre's per-studio filter. Nothing else on this path reads it.
+      // Pre-auth: the passkey has been verified but no session exists yet.
       `SELECT id, name, email, role, trainer_id, member_id, token_version, organization_id
-       FROM users WHERE id = $1 AND is_active = true AND deleted_at IS NULL`,
+       FROM auth_user_by_id($1)`,
       [cred.user_id]
     );
     if (!users.length) {

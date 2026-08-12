@@ -17,6 +17,17 @@ const store = [{ id: 'usr-1', email: 'admin@myptstudio.com' }];
 
 jest.mock('../db/pool', () => ({
   query: jest.fn(async (sql, params) => {
+    // The route now issues auth_issue_reset_token (migration 161): the lookup
+    // and the token write are one privileged step, because both run before
+    // tenant context exists and RLS hid the row from each. It returns the id
+    // it acted on, or NULL for an unknown address — which is what keeps the
+    // endpoint enumeration-safe.
+    if (/auth_issue_reset_token/i.test(sql)) {
+      // Mirrors the function's btrim(lower(...)) on both sides.
+      const q = String((params && params[0]) || '').trim().toLowerCase();
+      const row = store.find((u) => u.email.trim().toLowerCase() === q) || null;
+      return { rows: [{ id: row ? row.id : null }] };
+    }
     if (/from\s+users/i.test(sql) && /lower\(/i.test(sql)) {
       // Mirrors the route's btrim(LOWER(...)) on both sides.
       const q = String((params && params[0]) || '').trim().toLowerCase();

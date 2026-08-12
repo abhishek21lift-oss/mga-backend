@@ -69,6 +69,37 @@ jest.mock('../../db/pool', () => ({
       return { rows: [], rowCount: 1 };
     }
 
+    // reset-password now goes through auth_consume_reset_token (migration 161),
+    // because the whole flow runs before tenant context exists and RLS hid the
+    // rows it needed to write. The function's contract is the same atomic step
+    // the CTE was: verify the token, set the password, bump token_version,
+    // clear the token, revoke that user's refresh rows — all or nothing.
+    // The mock implements that contract so the behavioural assertions below
+    // still test real behaviour rather than a stub that does nothing.
+    if (/auth_consume_reset_token/i.test(q)) {
+      const [hashedToken, newHash] = params;
+      const uid = Object.keys(mockUsers).find((k) => mockUsers[k].reset_hash === hashedToken);
+      if (!uid) return { rows: [{ id: null }] };
+      const u = mockUsers[uid];
+      u.password = newHash;
+      u.token_version += 1;
+      u.reset_hash = null;
+      for (const t of mockTokens) {
+        if (t.user_id === uid && t.revoked_at === null) t.revoked_at = new Date();
+      }
+      return { rows: [{ id: uid }] };
+    }
+
+    if (/auth_issue_reset_token/i.test(q)) {
+      const [email, hashedToken] = params;
+      const uid = Object.keys(mockUsers).find(
+        (k) => String(mockUsers[k].email || '').trim().toLowerCase() === String(email).trim().toLowerCase()
+      );
+      if (!uid) return { rows: [{ id: null }] };
+      mockUsers[uid].reset_hash = hashedToken;
+      return { rows: [{ id: uid }] };
+    }
+
     // ORDER MATTERS. The fix writes the password and revokes the refresh rows in
     // ONE data-modifying CTE, so that statement matches the refresh_tokens
     // patterns below as well. It has to be claimed here first, or the mock would
@@ -266,19 +297,30 @@ describe('reset-password revokes every refresh token the user had', () => {
     await request(app()).post('/api/auth/reset-password')
       .send({ token: RESET_RAW, password: 'BrandNewPass1!' });
 
-    const pwIdx = mockSqlLog.findIndex((s) => /UPDATE users SET password/i.test(s));
-    expect(pwIdx).toBeGreaterThanOrEqual(0);
+    // The guarantee has MOVED, and this assertion moved with it rather than
+    // being loosened. The atomic CTE now lives inside auth_consume_reset_token
+    // (migration 161), because the reset flow runs before tenant context
+    // exists and RLS hid every row it needed to write. From this layer the
+    // route issues one statement and the ordering is no longer observable in
+    // the SQL text — it is the function's contract, enforced by being a single
+    // statement there.
+    //
+    // What this layer can still prove, and does: the route performs the reset
+    // in ONE call, with no separate revocation statement before it. A
+    // two-step implementation — the bug this test exists for — would show up
+    // as an extra refresh_tokens write.
+    const resetIdx = mockSqlLog.findIndex((s) => /auth_consume_reset_token/i.test(s));
+    expect(resetIdx).toBeGreaterThanOrEqual(0);
 
-    // No revocation may appear in a statement STRICTLY EARLIER than the password
-    // write. Same-statement is the ideal — that is the atomic CTE, and it is
-    // what the fix does — so equality is allowed; anything before it is not.
     const earlierRevoke = mockSqlLog
-      .slice(0, pwIdx)
+      .slice(0, resetIdx)
       .some((s) => /UPDATE refresh_tokens SET revoked_at/i.test(s));
     expect(earlierRevoke).toBe(false);
 
-    // And the revocation must genuinely be part of that same statement.
-    expect(mockSqlLog[pwIdx]).toMatch(/refresh_tokens/i);
+    const laterRevoke = mockSqlLog
+      .slice(resetIdx + 1)
+      .some((s) => /UPDATE refresh_tokens SET revoked_at/i.test(s));
+    expect(laterRevoke).toBe(false);
   });
 });
 

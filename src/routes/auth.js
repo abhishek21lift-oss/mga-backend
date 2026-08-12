@@ -344,14 +344,22 @@ router.post('/forgot-password', async (req, res) => {
     const rawToken = crypto.randomBytes(32).toString('hex');
     const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
 
-    // btrim on BOTH sides. A stored address with a stray leading or trailing
-    // space — easy to introduce when an operator pastes one into the admin UI
-    // — would never match, and the request would then look exactly like a
-    // broken mailer: the caller is told a link was sent, and nothing is sent.
-    const { rows } = await pool.query(
-      'SELECT id FROM users WHERE btrim(LOWER(email)) = btrim(LOWER($1))',
-      [email]
+    // One call, not a SELECT then an UPDATE. Both halves run before any tenant
+    // context exists, so under RLS the read matched nothing and the write that
+    // followed silently matched nothing either — the caller was told a link
+    // had been sent when none had, which is the worst failure shape available
+    // for account recovery. auth_issue_reset_token stores the token and
+    // returns the id it acted on, or NULL. See migration 161.
+    //
+    // btrim on BOTH sides is preserved inside the function. A stored address
+    // with a stray leading or trailing space — easy to introduce when an
+    // operator pastes one into the admin UI — would never match, and the
+    // request would then look exactly like a broken mailer.
+    const { rows: issued } = await pool.query(
+      'SELECT auth_issue_reset_token($1, $2) AS id',
+      [email, hashedToken]
     );
+    const rows = (issued[0] && issued[0].id) ? [{ id: issued[0].id }] : [];
 
     // Every outcome is logged server-side, because until now one of them was
     // not logged at all. A request for an address with no user did nothing and
@@ -366,11 +374,9 @@ router.post('/forgot-password', async (req, res) => {
       logger.warn({ email, outcome: 'unknown_address' },
         'Password reset requested for an address with no user account — nothing sent');
     } else {
-      await pool.query(
-        // M-07: 15-minute window — was 1 hour, which gave too large an interception window
-      'UPDATE users SET password_reset_token = $1, password_reset_expires = NOW() + INTERVAL \'15 minutes\' WHERE id = $2',
-        [hashedToken, rows[0].id]
-      );
+      // The token was already stored by auth_issue_reset_token above,
+      // with the same 15-minute window (M-07: it was 1 hour, which gave
+      // too large an interception window).
       sendPasswordReset(email, rawToken)
         .then(function(result) {
           if (result && result.sent === false) {
@@ -402,43 +408,28 @@ router.post('/reset-password', async (req, res) => {
     if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
 
     const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
-
-    const { rows } = await pool.query(
-      'SELECT id FROM users WHERE password_reset_token = $1 AND password_reset_expires > NOW()',
-      [hashedToken]
-    );
-
-    if (!rows.length) return res.status(400).json({ error: 'Invalid or expired reset token' });
-
     const hashed = await bcrypt.hash(password, 12);
-    // AUD-005. Bumping token_version kills the 15-minute ACCESS tokens, but
-    // refresh tokens live in their own table and /refresh never consults
-    // token_version — so without this, a stolen refresh token keeps minting new
-    // access tokens for the remaining 7 days, and rotation renews it each time.
+
+    // One privileged call. The lookup by token and every write that follows it
+    // run before any tenant context exists, so under RLS the read matched
+    // nothing and the writes silently matched nothing either — the caller was
+    // told the password had changed when it had not. See migration 161.
     //
-    // One statement, not two: the password write and the revocation have to
-    // succeed or fail together. If the revoke were a second query and it failed,
-    // the password would already have changed and the attacker's session would
-    // survive — exactly the bug this closes. A data-modifying CTE gives that
-    // atomicity without introducing transaction management into a handler that
-    // has never had any.
-    await pool.query(
-      `WITH pw AS (
-         UPDATE users
-            SET password = $1,
-                token_version = token_version + 1,
-                password_reset_token = NULL,
-                password_reset_expires = NULL,
-                updated_at = NOW()
-          WHERE id = $2
-         RETURNING id
-       )
-       UPDATE refresh_tokens
-          SET revoked_at = NOW()
-        WHERE user_id = (SELECT id FROM pw)
-          AND revoked_at IS NULL`,
-      [hashed, rows[0].id]
+    // AUD-005 is preserved inside the function. Bumping token_version kills
+    // the 15-minute ACCESS tokens, but refresh tokens live in their own table
+    // and /refresh never consults token_version — so without the revocation a
+    // stolen refresh token keeps minting access tokens for the remaining 7
+    // days, and rotation renews it each time. It remains a single statement
+    // there, for the reason this handler already documented: the password
+    // write and the revocation must succeed or fail together, or the
+    // attacker's session outlives the reset.
+    const { rows } = await pool.query(
+      'SELECT auth_consume_reset_token($1, $2) AS id',
+      [hashedToken, hashed]
     );
+    if (!rows[0] || rows[0].id === null) {
+      return res.status(400).json({ error: 'Invalid or expired reset token' });
+    }
     invalidateUserCache(rows[0].id);
 
     res.json({ message: 'Password reset successfully. Please log in with your new password.' });
