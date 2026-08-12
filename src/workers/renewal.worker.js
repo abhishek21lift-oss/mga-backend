@@ -26,9 +26,62 @@ const razorpay = require('../lib/razorpay');
 const logger = require('../lib/logger');
 const redis = require('../lib/redis');
 
+const { runWithTenantContext } = require('../lib/tenant-context');
+
 const REMINDER_DAYS = [7, 3, 1];   // send reminder when this many days remain
 
+/**
+ * Run `fn(orgId)` once per organization, inside that organization's tenant
+ * context.
+ *
+ * An HTTP request gets its tenant context from the authenticated user, in
+ * auth.js. A cron sweep has no user, so until now it had no context either,
+ * and its queries simply ran across every tenant at once. That was correct
+ * while the application connected as a role that bypasses RLS, and becomes
+ * silently wrong the moment it does not: strict policies would match nothing
+ * and the sweep would report success having sent no reminders at all.
+ *
+ * Two things together, not one:
+ *
+ *  · the tenant context, so RLS resolves for this organization; and
+ *  · an explicit organization_id filter in each query.
+ *
+ * The filter is not redundant. With TENANT_RLS_ENFORCE off the context is
+ * inert — pool.js ignores it — so a per-organization loop around unfiltered
+ * queries would process every tenant's rows once per organization, sending
+ * each member N duplicate reminders. The filter makes the loop correct in
+ * both modes, and leaves RLS as the backstop rather than the mechanism.
+ *
+ * One organization failing must not stop the rest: a Razorpay outage for one
+ * studio is not a reason to skip everybody else's reminders, so each is
+ * caught and logged individually.
+ */
+async function forEachOrganization(label, fn) {
+  // organizations carries no organization_id and no policy, so this runs
+  // without a tenant context by design — it is the platform-level query that
+  // establishes which contexts exist.
+  const { rows: orgs } = await pool.query(
+    `SELECT id, name FROM organizations WHERE status = 'active' ORDER BY id`
+  );
+  let ok = 0, failed = 0;
+  for (const org of orgs) {
+    try {
+      await runWithTenantContext(org.id, () => fn(org.id));
+      ok++;
+    } catch (err) {
+      failed++;
+      logger.error({ err: err.message, orgId: org.id, task: label },
+        'renewal task failed for one organization — continuing with the rest');
+    }
+  }
+  logger.info({ task: label, organizations: orgs.length, ok, failed }, 'renewal sweep complete');
+}
+
 async function runReminders() {
+  await forEachOrganization('reminders', (orgId) => remindersForOrg(orgId));
+}
+
+async function remindersForOrg(orgId) {
   for (const days of REMINDER_DAYS) {
     const { rows } = await pool.query(`
       SELECT m.id AS member_id, m.user_id, m.name, m.email, m.phone,
@@ -40,13 +93,14 @@ async function runReminders() {
       WHERE mm.status = 'active'
         AND (mm.end_date - CURRENT_DATE) = $1
         AND m.deleted_at IS NULL
-    `, [days]);
+        AND mm.organization_id = $2
+    `, [days, orgId]);
 
     for (const m of rows) {
       await notifier.send('membership_expiring', m, { days, plan: m.plan_name },
         ['inapp', 'email', 'whatsapp']);
     }
-    logger.info({ count: rows.length, days }, 'sent expiry reminders');
+    logger.info({ count: rows.length, days, orgId }, 'sent expiry reminders');
   }
 }
 
@@ -55,7 +109,10 @@ async function runAutoRenew() {
     logger.warn('Razorpay not configured — skipping auto-renew. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to enable.');
     return;
   }
+  await forEachOrganization('auto-renew', (orgId) => autoRenewForOrg(orgId));
+}
 
+async function autoRenewForOrg(orgId) {
   // Find memberships expiring TODAY with auto_renew=true and gateway available
   const { rows } = await pool.query(`
     SELECT mm.*, m.name, m.email, m.phone, m.user_id, pl.name AS plan_name, pl.duration, pl.price
@@ -65,7 +122,8 @@ async function runAutoRenew() {
     WHERE mm.auto_renew = TRUE
       AND mm.status = 'active'
       AND mm.end_date = CURRENT_DATE
-  `);
+      AND mm.organization_id = $1
+  `, [orgId]);
 
   for (const m of rows) {
     const client = await pool.connect();
@@ -119,10 +177,14 @@ async function runAutoRenew() {
       client.release();
     }
   }
-  logger.info({ count: rows.length }, 'auto-renew processed');
+  logger.info({ count: rows.length, orgId }, 'auto-renew processed');
 }
 
 async function runClassReminders() {
+  await forEachOrganization('class-reminders', (orgId) => classRemindersForOrg(orgId));
+}
+
+async function classRemindersForOrg(orgId) {
   // 30 minutes before each class, ping confirmed members
   const { rows } = await pool.query(`
     SELECT b.id AS booking_id, m.user_id, m.name, m.phone, m.email,
@@ -134,7 +196,8 @@ async function runClassReminders() {
     JOIN members m ON m.id = b.member_id
     WHERE b.status = 'confirmed'
       AND cs.starts_at BETWEEN NOW() + INTERVAL '25 minutes' AND NOW() + INTERVAL '35 minutes'
-  `);
+      AND b.organization_id = $1
+  `, [orgId]);
   for (const r of rows) {
     await notifier.send('class_reminder', r,
       { class_name: r.class_name, time: r.time }, ['inapp', 'whatsapp', 'push']);

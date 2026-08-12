@@ -11,6 +11,45 @@ const path = require('path');
 const pool = require('./pool');
 
 /**
+ * The connection migrations run on — privileged, and separate from the one the
+ * application serves traffic with.
+ *
+ * Migrations do DDL. The application role deliberately cannot: `app_tenant` is
+ * created NOSUPERUSER with no CREATE on schema public, because a runtime role
+ * that can reshape the schema is a much larger blast radius than one that can
+ * only read and write rows. Those two requirements are irreconcilable on one
+ * connection, and previously there was only one — so pointing DATABASE_URL at
+ * app_tenant made the server fail to boot at all:
+ *
+ *     migration attempt 1/5 failed: permission denied for schema public
+ *
+ * That is the correct refusal, not a bug to grant away. So migrations use
+ * MIGRATION_DATABASE_URL when it is set, and DATABASE_URL when it is not —
+ * which keeps every existing deployment working unchanged, since today both
+ * roles are the same role.
+ *
+ * The migration pool is deliberately a plain Pool, not the shared one from
+ * ./pool: that instance is wrapped to inject app.org_id per request, and a
+ * schema migration is a platform operation with no tenant to scope it to.
+ */
+const MIGRATION_URL = process.env.MIGRATION_DATABASE_URL || null;
+
+function migrationPool() {
+  if (!MIGRATION_URL) return { pool, release: () => {} };
+  // Required lazily so a deployment that never sets the variable pays nothing.
+  const { Pool } = require('pg');
+  const dedicated = new Pool({
+    connectionString: MIGRATION_URL,
+    ssl: new URL(MIGRATION_URL).searchParams.get('sslmode') === 'disable'
+      ? false
+      : { rejectUnauthorized: false },
+    max: 1,                       // one migration at a time, by design
+    connectionTimeoutMillis: 30_000,
+  });
+  return { pool: dedicated, release: () => dedicated.end().catch(() => {}) };
+}
+
+/**
  * The foundation marker recorded in _migrations once schema.sql has been
  * applied.
  *
@@ -128,7 +167,9 @@ async function clearStaleLock(client) {
 }
 
 async function runMigrations() {
-  const client = await pool.connect();
+  const { pool: mpool, release: releasePool } = migrationPool();
+  if (MIGRATION_URL) console.log('  · migrating via MIGRATION_DATABASE_URL (privileged role)');
+  const client = await mpool.connect();
   let holdsLock = false;
   try {
     // Acquire the advisory lock WITHOUT blocking. A blocking pg_advisory_lock()
@@ -196,6 +237,9 @@ async function runMigrations() {
       await client.query('SELECT pg_advisory_unlock($1)', [LOCK_ID]).catch(function() {});
     }
     client.release();
+    // Only closes the dedicated migration pool; the shared application pool is
+    // left open, because the server keeps serving requests on it.
+    await releasePool();
   }
 }
 
