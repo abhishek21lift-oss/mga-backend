@@ -11,6 +11,80 @@ const path = require('path');
 const pool = require('./pool');
 
 /**
+ * The foundation marker recorded in _migrations once schema.sql has been
+ * applied.
+ *
+ * Deliberately not a plausible filename: it carries a slash, which no
+ * basename from readdirSync(migrations) ever will, so it can never collide
+ * with a real migration and can never be mistaken for one when reading the
+ * table by hand. The runner's UNIQUE(filename) column stores it as-is.
+ */
+const FOUNDATION_MARKER = 'foundation/schema-v4.sql';
+
+/**
+ * Apply src/db/schema.sql — the foundational schema the migration chain
+ * assumes already exists.
+ *
+ * ── Why this is needed ────────────────────────────────────────────────────
+ *
+ * runMigrations() globs migrations/*.sql, and schema.sql sits one directory
+ * above that, so it was never applied by anything. On a database that already
+ * had the v3/v4 schema (every deployment to date) this was invisible. Against
+ * a genuinely empty database it is fatal at the very first file: verified on
+ * PostgreSQL 17.10, migrations alone apply 0 of 169 and fail with
+ * `42P01 relation "clients" does not exist`, because 001_v4_upgrade.sql is —
+ * as its own header says — an upgrade for an existing v3 database. With the
+ * foundation applied first, 166 of 169 apply; the three that do not are
+ * blocked solely by pgvector being unavailable in that test environment.
+ *
+ * ── Why it is safe to run against an existing database ────────────────────
+ *
+ * schema.sql was audited construct by construct and is idempotent throughout:
+ * every CREATE TABLE/INDEX/EXTENSION carries IF NOT EXISTS, the five enum
+ * types are wrapped in `EXCEPTION WHEN duplicate_object`, the two ALTER TABLE
+ * constraints test pg_constraint first, the updated_at trigger tests
+ * pg_trigger, the function is CREATE OR REPLACE, and all four seed INSERTs
+ * are ON CONFLICT DO NOTHING or guarded by NOT EXISTS. It contains no DROP
+ * and no TRUNCATE, so it cannot destroy an existing schema or its data.
+ *
+ * It therefore runs at most once per database (guarded by the marker below),
+ * and even if it ran again it would be a no-op rather than a hazard.
+ */
+async function applyFoundation(client) {
+  const { rows } = await client.query(
+    'SELECT id FROM _migrations WHERE filename=$1', [FOUNDATION_MARKER]
+  );
+  if (rows.length > 0) {
+    console.log(`  ✓ ${FOUNDATION_MARKER} (already applied)`);
+    return;
+  }
+
+  const schemaPath = path.join(__dirname, 'schema.sql');
+  if (!fs.existsSync(schemaPath)) {
+    // Not fatal: a deployment that has already been migrated does not need
+    // the foundation, and refusing to boot over a missing file would turn a
+    // packaging slip into an outage. Loud, though — on an empty database the
+    // next statement is the one that fails.
+    console.warn(`  ! ${schemaPath} not found — skipping foundation`);
+    return;
+  }
+
+  console.log(`  → Applying ${FOUNDATION_MARKER}…`);
+  const sql = fs.readFileSync(schemaPath, 'utf8');
+  await client.query('BEGIN');
+  try {
+    await client.query(sql);
+    await client.query('INSERT INTO _migrations (filename) VALUES ($1)', [FOUNDATION_MARKER]);
+    await client.query('COMMIT');
+    console.log(`  ✓ ${FOUNDATION_MARKER} applied`);
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(`  ✗ ${FOUNDATION_MARKER} FAILED:`, err.message);
+    throw err;
+  }
+}
+
+/**
  * Apply any pending migrations from src/db/migrations/*.sql.
  * Safe to call on every startup — already-applied files are skipped.
  * Does NOT close the pool so the server can keep using it.
@@ -88,6 +162,8 @@ async function runMigrations() {
         applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+
+    await applyFoundation(client);
 
     const dir   = path.join(__dirname, 'migrations');
     const files = fs.readdirSync(dir).filter(f => f.endsWith('.sql')).sort();

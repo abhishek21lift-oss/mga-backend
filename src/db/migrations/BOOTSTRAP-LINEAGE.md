@@ -112,17 +112,21 @@ genuinely contains their effects. A dump taken from a database where all 169
 have run does contain them; a hand-written baseline would not, and marking
 them would be a lie the next engineer inherits.
 
-## Status
+## Status — resolved, see DATABASE-BOOTSTRAP.md
 
 - [x] Migration lineage analysed
-- [x] Baseline confirmed necessary, from the files
 - [x] Runner's tracking mechanism identified
-- [ ] `000_source_schema.sql` obtained — **not provided**
-- [ ] `000_baseline.sql` written
-- [ ] Replay against a disposable Postgres
-- [ ] Schema diff against source
-- [ ] Reproducibility (build twice, compare)
-- [ ] Application boots against the result
+- [x] Replayed against a disposable PostgreSQL 17.10 — migrations alone apply
+      0 of 169; foundation first, then migrations, applies 166 of 169
+- [x] Foundation wired into the runner (`applyFoundation` in `migrate.js`)
+- [x] Fresh-database bootstrap verified end to end
+- [x] Re-run and existing-database safety verified
+- [ ] Full 169/169 replay — blocked only on a pgvector-capable PostgreSQL 17
 
-The last five are blocked on a schema-only dump and a throwaway PostgreSQL.
-Neither was available in the environment where this analysis was run.
+**The conclusion this document reached — that a synthesised baseline was
+required — did not survive the experiment.** It was written from static
+analysis, before a Postgres was available to test against. Running the chain
+showed the foundation in `schema.sql` is sufficient and the only defect was
+that nothing applied it. No `000_baseline.sql` was written, and none is
+needed. The operational procedure now lives in `DATABASE-BOOTSTRAP.md`; this
+file is kept for the lineage evidence, which is still accurate.
