@@ -106,32 +106,178 @@ async function attempt(c, sql, params = []) {
   }
 }
 
-/** Build a minimal INSERT for `table`, filling required columns with values
- *  the column's own type accepts. Returns null when the table needs something
- *  we cannot synthesise (a foreign key to a row we did not create). */
-async function synthesise(admin, table, orgId) {
+/* ── Fixture creation ──────────────────────────────────────────────────────
+ *
+ * A tenant table is only testable if a row can be put in it, and most of them
+ * cannot be filled in isolation: they carry NOT NULL foreign keys, so a row
+ * needs a parent, whose parent needs a grandparent. The first version of this
+ * script gave up whenever it met a required uuid column, which is why it
+ * covered 13 of 50 strict tables.
+ *
+ * Inventing a uuid instead would be worse than useless — the FK would reject
+ * it, and if it did not, the test would be exercising a row the application
+ * could never create. So the graph is read from pg_constraint and walked:
+ * to build a child, build its parents first.
+ */
+
+/** Foreign keys of `table`: which local column points at which parent. */
+async function foreignKeys(admin, table, cache) {
+  if (cache.has(table)) return cache.get(table);
   const { rows } = await admin.query(`
-    SELECT column_name, data_type, udt_name, is_nullable, column_default
+    SELECT att.attname AS column_name,
+           cl.relname  AS parent_table,
+           patt.attname AS parent_column
+      FROM pg_constraint con
+      JOIN pg_class    c   ON c.oid = con.conrelid
+      JOIN pg_class    cl  ON cl.oid = con.confrelid
+      JOIN unnest(con.conkey)  WITH ORDINALITY AS k(attnum, ord)  ON true
+      JOIN unnest(con.confkey) WITH ORDINALITY AS fk(attnum, ord) ON fk.ord = k.ord
+      JOIN pg_attribute att  ON att.attrelid = con.conrelid  AND att.attnum = k.attnum
+      JOIN pg_attribute patt ON patt.attrelid = con.confrelid AND patt.attnum = fk.attnum
+     WHERE con.contype = 'f' AND c.relname = $1
+       AND c.relnamespace = 'public'::regnamespace`, [table]);
+  cache.set(table, rows);
+  return rows;
+}
+
+/**
+ * Values a CHECK constraint will actually accept, per column.
+ *
+ * Most skips were 23514: a status column defaulted to the fixture's generic
+ * string and the table's own CHECK rejected it. Rather than hardcode each
+ * table's vocabulary, read the constraint and take a value it permits —
+ * enum-style checks (`col = ANY (ARRAY['a','b'])`, `col IN ('a','b')`) are
+ * the shape that accounts for nearly all of them.
+ */
+async function checkAllowedValues(admin, table, cache) {
+  if (cache.has(table)) return cache.get(table);
+  const { rows } = await admin.query(`
+    SELECT pg_get_constraintdef(con.oid) AS def
+      FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid
+     WHERE con.contype='c' AND c.relname=$1 AND c.relnamespace='public'::regnamespace`, [table]);
+  const map = new Map();
+  for (const { def } of rows) {
+    // CHECK (((status)::text = ANY ((ARRAY['a'::character varying, …])::text[])))
+    const m = def.match(/\(?\(?([a-zA-Z_][a-zA-Z0-9_]*)\)?::?\w*\s*(?:=\s*ANY|IN)\s*\(?\(?ARRAY?\s*\[([^\]]+)\]/i)
+           || def.match(/\(?\(?([a-zA-Z_][a-zA-Z0-9_]*)\)?::?\w*\s*IN\s*\(([^)]+)\)/i);
+    if (!m) continue;
+    const first = (m[2].match(/'([^']+)'/) || [])[1];
+    if (first && !map.has(m[1])) map.set(m[1], first);
+  }
+  cache.set(table, map);
+  return map;
+}
+
+/** Columns that must be supplied: NOT NULL, no default. */
+async function requiredColumns(admin, table, cache) {
+  if (cache.has(table)) return cache.get(table);
+  const { rows } = await admin.query(`
+    SELECT column_name, udt_name, is_nullable, column_default
       FROM information_schema.columns
      WHERE table_schema='public' AND table_name=$1 ORDER BY ordinal_position`, [table]);
-  const cols = [], vals = [];
-  for (const c of rows) {
-    if (c.column_name === 'organization_id') { cols.push(c.column_name); vals.push(orgId); continue; }
+  cache.set(table, rows);
+  return rows;
+}
+
+/**
+ * Create one row in `table` for `orgId`, creating any parents it requires.
+ *
+ * Returns { id } on success, or { skipped: reason } — never a fabricated key.
+ * `seen` carries the ancestry of the current descent so a cycle is reported
+ * rather than recursed into forever.
+ */
+async function makeFixture(admin, table, orgId, ctx, seen = []) {
+  if (seen.includes(table)) return { skipped: `cycle ${[...seen, table].join(' → ')}` };
+  if (seen.length > 6) return { skipped: `dependency chain deeper than 6 (${seen.join(' → ')})` };
+
+  const cols = await requiredColumns(admin, table, ctx.colCache);
+  const fks = await foreignKeys(admin, table, ctx.fkCache);
+  const allowed = await checkAllowedValues(admin, table, ctx.chkCache);
+  const fkByCol = new Map(fks.map((f) => [f.column_name, f]));
+
+  const names = [], vals = [];
+  for (const c of cols) {
+    if (c.column_name === 'organization_id') { names.push(c.column_name); vals.push(orgId); continue; }
     if (c.is_nullable === 'YES' || c.column_default !== null) continue;
+    if (allowed.has(c.column_name)) { names.push(c.column_name); vals.push(allowed.get(c.column_name)); continue; }
+
+    const fk = fkByCol.get(c.column_name);
+    if (fk) {
+      // Reuse a parent already made for this tenant before making another.
+      const key = `${fk.parent_table}:${orgId}`;
+      let parentId = ctx.made.get(key);
+      if (parentId === undefined) {
+        const r = await makeFixture(admin, fk.parent_table, orgId, ctx, [...seen, table]);
+        if (r.skipped) return { skipped: `needs ${fk.parent_table}: ${r.skipped}` };
+        parentId = r.id;
+        ctx.made.set(key, parentId);
+      }
+      if (parentId === null || parentId === undefined) return { skipped: `parent ${fk.parent_table} produced no id` };
+      names.push(c.column_name); vals.push(parentId);
+      continue;
+    }
+
     const t = c.udt_name;
     let v;
     if (/^(int2|int4|int8|numeric|float4|float8)$/.test(t)) v = 0;
     else if (t === 'bool') v = false;
-    else if (/^(timestamptz|timestamp|date)$/.test(t)) v = new Date().toISOString();
-    else if (t === 'uuid') return null;            // an FK we cannot satisfy
+    else if (/^(timestamptz|timestamp|date|time)$/.test(t)) v = new Date().toISOString();
     else if (t === 'jsonb' || t === 'json') v = '{}';
-    else if (/^(text|varchar|bpchar|citext)$/.test(t)) v = 'rls-fixture';
-    else return null;                               // enum or exotic type
-    cols.push(c.column_name); vals.push(v);
+    else if (t === 'uuid') v = crypto.randomUUID();       // not an FK: a free id
+    else if (/^(text|varchar|bpchar|citext|name)$/.test(t)) v = `rls-${ctx.run}-${Math.random().toString(36).slice(2, 8)}`;
+    else return { skipped: `unsupported required column ${c.column_name} (${t})` };
+    names.push(c.column_name); vals.push(v);
   }
-  if (!cols.includes('organization_id')) return null;
-  const ph = cols.map((_, i) => `$${i + 1}`).join(',');
-  return { sql: `INSERT INTO public.${table} (${cols.map((c) => `"${c}"`).join(',')}) VALUES (${ph}) RETURNING id`, vals };
+
+  // Only the table under test must be tenant-scoped. A parent created on the
+  // way there legitimately may not be — platform_features, subscription_plans
+  // and clients are all shared or platform-owned, and refusing to build them
+  // was blocking six otherwise-testable children.
+  if (seen.length === 0 && !names.includes('organization_id')) {
+    return { skipped: 'no organization_id column' };
+  }
+  const ph = names.map((_, i) => `$${i + 1}`).join(',');
+  const sql = `INSERT INTO public.${table} (${names.map((n) => `"${n}"`).join(',')}) VALUES (${ph}) RETURNING *`;
+  try {
+    const { rows } = await admin.query(sql, vals);
+    return { id: rows[0] && (rows[0].id ?? null), row: rows[0] };
+  } catch (e) {
+    return { skipped: `${e.code}: ${e.message.slice(0, 70)}` };
+  }
+}
+
+/** The INSERT statement (not executed) that would create a row for `orgId`. */
+async function insertStatementFor(admin, table, orgId, ctx) {
+  const cols = await requiredColumns(admin, table, ctx.colCache);
+  const fks = await foreignKeys(admin, table, ctx.fkCache);
+  const allowed = await checkAllowedValues(admin, table, ctx.chkCache);
+  const fkByCol = new Map(fks.map((f) => [f.column_name, f]));
+  const names = [], vals = [];
+  for (const c of cols) {
+    if (c.column_name === 'organization_id') { names.push(c.column_name); vals.push(orgId); continue; }
+    if (c.is_nullable === 'YES' || c.column_default !== null) continue;
+    if (allowed.has(c.column_name)) { names.push(c.column_name); vals.push(allowed.get(c.column_name)); continue; }
+    const fk = fkByCol.get(c.column_name);
+    if (fk) {
+      const parentId = ctx.made.get(`${fk.parent_table}:${orgId}`);
+      if (parentId === undefined) return null;
+      names.push(c.column_name); vals.push(parentId);
+      continue;
+    }
+    const t = c.udt_name;
+    let v;
+    if (/^(int2|int4|int8|numeric|float4|float8)$/.test(t)) v = 0;
+    else if (t === 'bool') v = false;
+    else if (/^(timestamptz|timestamp|date|time)$/.test(t)) v = new Date().toISOString();
+    else if (t === 'jsonb' || t === 'json') v = '{}';
+    else if (t === 'uuid') v = crypto.randomUUID();
+    else if (/^(text|varchar|bpchar|citext|name)$/.test(t)) v = `rls-${ctx.run}-${Math.random().toString(36).slice(2, 8)}`;
+    else return null;
+    names.push(c.column_name); vals.push(v);
+  }
+  if (!names.includes('organization_id')) return null;
+  const ph = names.map((_, i) => `$${i + 1}`).join(',');
+  return { sql: `INSERT INTO public.${table} (${names.map((n) => `"${n}"`).join(',')}) VALUES (${ph})`, vals };
 }
 
 (async () => {
@@ -200,19 +346,30 @@ async function synthesise(admin, table, orgId) {
   const strict = policied.filter((p) => !/IS NULL/i.test(p.qual || '')).map((p) => p.tablename);
   note(`policies ${policied.length} (strict ${strict.length}, shared ${policied.length - strict.length})`);
 
-  // Seed one row per strict table for each tenant, as the owner.
-  const usable = [];
+  // Seed one row per strict table for each tenant, as the owner, creating
+  // whatever parents each table requires.
+  const ctx = { colCache: new Map(), fkCache: new Map(), chkCache: new Map(), made: new Map(), run: RUN };
+  ctx.made.set(`organizations:${A.id}`, A.id);
+  ctx.made.set(`organizations:${B.id}`, B.id);
+
+  const usable = [], skipped = [];
   for (const t of strict) {
-    const sa = await synthesise(admin, t, A.id);
-    const sb = await synthesise(admin, t, B.id);
-    if (!sa || !sb) continue;
-    try {
-      const ra = await admin.query(sa.sql, sa.vals);
-      const rb = await admin.query(sb.sql, sb.vals);
-      usable.push({ table: t, aId: ra.rows[0] && ra.rows[0].id, bId: rb.rows[0] && rb.rows[0].id });
-    } catch { /* table needs more than we can synthesise — skip */ }
+    const ra = await makeFixture(admin, t, A.id, ctx);
+    if (ra.skipped) { skipped.push({ table: t, reason: ra.skipped }); continue; }
+    const rb = await makeFixture(admin, t, B.id, ctx);
+    if (rb.skipped) { skipped.push({ table: t, reason: rb.skipped }); continue; }
+    usable.push({ table: t, aId: ra.id, bId: rb.id, hasId: ra.id != null && rb.id != null });
   }
-  note(`seeded fixtures in ${usable.length} of ${strict.length} strict tenant tables`);
+  note(`strict tables ${strict.length} | fixtures created ${usable.length} | not covered ${skipped.length}`);
+  if (skipped.length) {
+    // Every uncovered table is named with its reason: an unexplained gap in a
+    // security test is indistinguishable from a passing one.
+    for (const s of skipped.slice(0, 40)) emit(`    SKIP  ${s.table} — ${s.reason}`);
+    if (process.env.GITHUB_ACTIONS) {
+      console.log(`::notice title=RLS coverage::not covered (${skipped.length}): ` +
+        skipped.map((s) => `${s.table} [${s.reason}]`).join('; ').slice(0, 900));
+    }
+  }
   if (usable.length === 0) { bad('at least one tenant table seeded'); process.exit(1); }
 
   const asTenant = () => connect(urlFor(DB, 'app_tenant', APP_PW));
@@ -273,21 +430,31 @@ async function synthesise(admin, table, orgId) {
   head('STEP 8 — INSERT with a forged organization_id');
   {
     const c = await asTenant();
-    const t = usable[0].table;
-    const forged = await synthesise(admin, t, B.id);
+    // Every table we can build a statement for, not just one: WITH CHECK is
+    // per-policy, so one table proving it says nothing about the other 49.
+    const forgedOk = [], forgedLeak = [], legitOk = [], legitBlocked = [];
     await withOrg(c, A.id, async () => {
-      const f = await attempt(c, forged.sql, forged.vals);
-      f.denied
-        ? ok('forged INSERT rejected', f.code === '42501' ? 'row-level security policy' : f.code)
-        : bad('forged INSERT rejected', 'it succeeded');
-      // Same connection, same transaction: proves the savepoint left the
-      // tenant context intact after a refusal, not just that both work alone.
-      const own = await synthesise(admin, t, A.id);
-      const g = await attempt(c, own.sql, own.vals);
-      g.denied
-        ? bad('legitimate INSERT accepted after a refusal', g.code)
-        : ok('legitimate INSERT accepted after a refusal', t);
+      for (const { table } of usable) {
+        const forged = await insertStatementFor(admin, table, B.id, ctx);
+        if (forged) {
+          const f = await attempt(c, forged.sql, forged.vals);
+          (f.denied ? forgedOk : forgedLeak).push(table);
+        }
+        const own = await insertStatementFor(admin, table, A.id, ctx);
+        if (own) {
+          const g = await attempt(c, own.sql, own.vals);
+          (g.denied ? legitBlocked : legitOk).push(table);
+        }
+      }
     });
+    forgedLeak.length === 0
+      ? ok('forged INSERT rejected on every table tried', `${forgedOk.length} tables`)
+      : bad('forged INSERT rejected', `accepted on: ${forgedLeak.slice(0, 6).join(', ')}`);
+    // Same connection and transaction as the refusals above, so this also
+    // proves the savepoints left the tenant context usable.
+    legitOk.length > 0
+      ? ok('legitimate INSERT still accepted after refusals', `${legitOk.length} tables`)
+      : bad('legitimate INSERT still accepted after refusals', `all blocked (${legitBlocked.length})`);
     await c.end();
   }
 
@@ -343,6 +510,39 @@ async function synthesise(admin, table, orgId) {
     const { table } = usable[0];
     const { rows } = await admin.query(`SELECT count(*)::int n FROM public.${table} WHERE organization_id=$1`, [B.id]);
     rows[0].n > 0 ? ok("tenant B's data survived tenant A's attempts", `${rows[0].n} row(s)`) : bad("tenant B's data survived");
+  }
+
+  head('STEP 6/7 — shared tables');
+  {
+    // "Shared" means the policy also admits organization_id IS NULL, for
+    // reference content every studio draws on. That is only safe if the NULL
+    // rows really are global — a tenant-private row that happens to have a
+    // NULL organization_id would be visible to everybody, which is the exact
+    // failure this section looks for.
+    const shared = policied.filter((p) => /IS NULL/i.test(p.qual || '')).map((p) => p.tablename);
+    note(`shared tables (${shared.length}): ${shared.join(', ')}`);
+    const cA = await asTenant(), cB = await asTenant();
+    const leaks = [];
+    for (const t of shared) {
+      const priv = await makeFixture(admin, t, B.id, ctx);   // a B-owned row
+      const { rows: [g] } = await admin.query(
+        `SELECT count(*)::int n FROM public.${t} WHERE organization_id IS NULL`);
+      let seenByA = 0, globalByA = 0;
+      await withOrg(cA, A.id, async () => {
+        const { rows } = await cA.query(
+          `SELECT count(*) FILTER (WHERE organization_id=$1)::int other,
+                  count(*) FILTER (WHERE organization_id IS NULL)::int glob
+             FROM public.${t}`, [B.id]);
+        seenByA = rows[0].other; globalByA = rows[0].glob;
+      });
+      if (seenByA > 0) leaks.push(`${t} (${seenByA} B-owned rows visible to A)`);
+      emit(`    ${t.padEnd(28)} global rows ${String(g.n).padStart(4)} | A sees global ${String(globalByA).padStart(4)} | A sees B-owned ${seenByA}` +
+           (priv.skipped ? '  [no B fixture: ' + priv.skipped.slice(0, 40) + ']' : ''));
+    }
+    leaks.length === 0
+      ? ok('shared policies expose no tenant-private rows across tenants', `${shared.length} tables`)
+      : bad('shared policies leak tenant-private rows', leaks.join('; '));
+    await cA.end(); await cB.end();
   }
 
   head('STEP 18 — concurrent tenants on separate connections');
