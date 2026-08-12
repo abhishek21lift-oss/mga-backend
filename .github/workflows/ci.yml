@@ -147,3 +147,29 @@ jobs:
 
       - name: Verify fresh-database bootstrap
         run: node scripts/db-bootstrap-verify.js
+
+      # A schema the application cannot actually boot against is not a
+      # verified bootstrap. This starts the real server against the database
+      # the step above built from nothing, waits for /api/health, and reports
+      # what it answered.
+      - name: Boot the application against the fresh database
+        env:
+          NODE_ENV: test
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/mga_bootstrap_a?sslmode=disable
+          JWT_SECRET: ci-boot-check-secret-not-a-real-credential-000000
+          FRONTEND_URL: http://localhost:3000
+          PORT: '5000'
+        run: |
+          node src/server.js & echo $! > /tmp/server.pid
+          for i in $(seq 1 45); do
+            body=$(curl -fsS --max-time 5 http://127.0.0.1:5000/api/health 2>/dev/null) && {
+              echo "health responded after ${i}s:"; echo "$body"
+              { echo "## Application boot"; echo; echo '```json'; echo "$body"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+              kill "$(cat /tmp/server.pid)" 2>/dev/null || true
+              exit 0
+            }
+            sleep 1
+          done
+          echo "server did not answer /api/health within 45s"
+          kill "$(cat /tmp/server.pid)" 2>/dev/null || true
+          exit 1
