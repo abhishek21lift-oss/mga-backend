@@ -271,7 +271,12 @@ jobs:
           PW=$(node -e "console.log(require('crypto').randomBytes(18).toString('hex'))")
           PGPASSWORD=postgres psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 \
             -c "ALTER ROLE app_tenant WITH LOGIN PASSWORD '$PW'"
+          # Runtime traffic on the unprivileged role; migrations on the
+          # privileged one. Without the split the server cannot start at all —
+          # app_tenant has no CREATE on schema public, so the boot-time
+          # migration check fails with "permission denied for schema public".
           export DATABASE_URL="postgresql://app_tenant:$PW@localhost:5432/mga_rls_test?sslmode=disable"
+          export MIGRATION_DATABASE_URL="postgresql://postgres:postgres@localhost:5432/mga_rls_test?sslmode=disable"
 
           node src/server.js > /tmp/enforce.log 2>&1 & echo $! > /tmp/enforce.pid
           for i in $(seq 1 45); do
