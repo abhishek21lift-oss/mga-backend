@@ -304,3 +304,115 @@ jobs:
           tail -40 /tmp/enforce.log || true
           kill "$(cat /tmp/enforce.pid)" 2>/dev/null || true
           exit 1
+
+  # ── Job 6: API IDOR tenant isolation ───────────────────────────────
+  #
+  # The database suite proves policies hold when SQL runs as app_tenant. It
+  # cannot see the layer above: a route that reads through a service path,
+  # aggregates without a tenant filter, or simply trusts an id from the URL.
+  # This drives the real Express app over HTTP with real tokens from the real
+  # login route, so each request travels auth → tenant resolution →
+  # authorization → RLS.
+  #
+  # Separate from the `rls` job on purpose. Folding them together would let a
+  # database pass mask an API failure in a single green tick, and these answer
+  # different questions.
+  api-idor:
+    name: API IDOR (app_tenant + enforcement)
+    runs-on: ubuntu-latest
+    env:
+      ADMIN_URL: postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable
+      API_IDOR_DB: mga_idor_test
+      # Throwaway, deterministic, and not a credential to anything that exists.
+      JWT_SECRET: ci-api-idor-secret-not-a-real-credential-000000
+      FRONTEND_URL: http://localhost:3000
+      NODE_ENV: test
+      RUN_WORKERS: '0'
+      COMMAND_CENTER_STREAM: 'off'
+      TENANT_RLS_ENFORCE: 'on'
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Preconditions, asserted rather than assumed. Each of these failing
+      # would otherwise surface as a confusing suite error much later.
+      - name: Verify PostgreSQL 17 and pgvector
+        run: |
+          set -euo pipefail
+          PSQL="psql postgresql://postgres:postgres@localhost:5432/postgres -tAX -v ON_ERROR_STOP=1"
+          MAJOR=$($PSQL -c "SHOW server_version_num" | cut -c1-2)
+          echo "server_version_num major: $MAJOR"
+          [ "$MAJOR" -ge 17 ] || { echo "::error::PostgreSQL 17 required, got major $MAJOR"; exit 1; }
+          HAVE=$($PSQL -c "SELECT count(*) FROM pg_available_extensions WHERE name='vector'")
+          [ "$HAVE" = "1" ] || { echo "::error::pgvector is not available in this image"; exit 1; }
+          echo "pgvector available"
+
+      - name: Bootstrap the database with the privileged role
+        env:
+          MIGRATION_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/mga_idor_test?sslmode=disable
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/mga_idor_test?sslmode=disable
+        run: |
+          set -euo pipefail
+          PSQL="psql postgresql://postgres:postgres@localhost:5432/postgres -v ON_ERROR_STOP=1"
+          $PSQL -c "DROP DATABASE IF EXISTS mga_idor_test WITH (FORCE)"
+          $PSQL -c "CREATE DATABASE mga_idor_test"
+          # Supabase provides these; a plain PostgreSQL must be given them or
+          # 27 migrations fail with 42704 role "anon" does not exist.
+          for r in anon authenticated service_role; do
+            $PSQL -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='$r') THEN CREATE ROLE $r NOLOGIN; END IF; END \$\$;"
+          done
+          node src/db/migrate.js
+
+      - name: Give app_tenant a password and verify it cannot bypass RLS
+        run: |
+          set -euo pipefail
+          PW=$(node -e "console.log(require('crypto').randomBytes(18).toString('hex'))")
+          echo "APP_TENANT_PW=$PW" >> "$GITHUB_ENV"
+          PSQL="psql postgresql://postgres:postgres@localhost:5432/mga_idor_test -tAX -v ON_ERROR_STOP=1"
+          $PSQL -c "ALTER ROLE app_tenant WITH LOGIN PASSWORD '$PW'"
+          FLAGS=$($PSQL -c "SELECT rolsuper||' '||rolbypassrls||' '||rolcreatedb||' '||rolcreaterole||' '||rolreplication FROM pg_roles WHERE rolname='app_tenant'")
+          echo "app_tenant [super bypassrls createdb createrole replication] = $FLAGS"
+          [ "$FLAGS" = "f f f f f" ] || { echo "::error::app_tenant has privileges it must not have: $FLAGS"; exit 1; }
+
+      # The suite refuses to report IDOR results unless each session can first
+      # reach its OWN tenant, so a broken login fails the job rather than
+      # turning every 401 into a passing "denial".
+      - name: Run the API IDOR suite as app_tenant
+        env:
+          DATABASE_URL: postgresql://app_tenant:${{ env.APP_TENANT_PW }}@localhost:5432/mga_idor_test?sslmode=disable
+          MIGRATION_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/mga_idor_test?sslmode=disable
+          REDIS_URL: redis://localhost:6379
+        run: node scripts/api-idor-verify.js
