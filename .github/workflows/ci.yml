@@ -134,6 +134,20 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      # /api/health reports 503 unless BOTH Postgres and Redis answer (see
+      # lib/health.js). That is the real contract a load balancer probes, so
+      # the boot check below is given a real Redis rather than being relaxed
+      # to accept a degraded response.
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -158,7 +172,11 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/mga_bootstrap_a?sslmode=disable
           JWT_SECRET: ci-boot-check-secret-not-a-real-credential-000000
           FRONTEND_URL: http://localhost:3000
+          REDIS_URL: redis://localhost:6379
           PORT: '5000'
+          # Workers would drain queues against a throwaway Redis for no
+          # benefit and add noise to the boot window.
+          RUN_WORKERS: '0'
         run: |
           node src/server.js & echo $! > /tmp/server.pid
           for i in $(seq 1 45); do
