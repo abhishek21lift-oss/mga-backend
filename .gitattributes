@@ -1,0 +1,33 @@
+# Normalise line endings to LF in the working tree, on every platform.
+#
+# Several tests in src/__tests__ read application source as text and match
+# against literals containing "\n" — tenantRlsFlag.test.js and the tenant
+# convention tests, among others. Under the default Windows behaviour
+# (core.autocrlf=true, which this machine has set), a checkout rewrites those
+# files to CRLF, every "\n" literal stops matching, and the tests fail on a
+# developer's machine while passing in Linux CI. That is the worst failure
+# mode available: red locally, green in CI, so the local red gets ignored —
+# and these are the tests guarding the tenant boundary during the RLS rollout.
+#
+# Fixing the tests to tolerate both line endings treats the symptom; the files
+# themselves should simply be LF everywhere, which is what they are in the
+# repository already.
+#
+# After adding this file, renormalise the existing working tree once:
+#   git add --renormalize .
+* text=auto eol=lf
+
+# Binary content must never be touched by the above.
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.pdf    binary
+*.woff   binary
+*.woff2  binary
+*.ttf    binary
+*.eot    binary
+*.zip    binary
+*.gz     binary
+*.xlsx   binary

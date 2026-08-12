@@ -1,0 +1,16 @@
+node_modules/
+.env
+.env.*
+*.log
+dist/
+coverage/
+.idea/
+.vscode/
+*.pem
+*.key
+*.crt
+uploads/
+
+# python bytecode (from .claude skill scripts)
+__pycache__/
+*.pyc

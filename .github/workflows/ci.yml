@@ -1,0 +1,101 @@
+name: CI — Lint · Test · Audit
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main]
+  # Manual re-run.
+  #
+  # GitHub does not trigger `push` workflows for pushes authenticated with an
+  # app or bot token — it is a recursion guard. So a commit landed that way
+  # gets no CI run at all, and since deploy.yml now waits on CI's conclusion,
+  # that means no deploy either: the commit is on main and nothing happens.
+  # This button is how such a commit gets a result without an empty commit
+  # pushed by hand.
+  workflow_dispatch:
+
+# Cancel in-progress runs on the same branch to save CI minutes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Job 1: Lint ────────────────────────────────────────────────────
+  lint:
+    name: ESLint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        # The backlog is cleared, so the ceiling is zero: any new warning fails
+        # CI immediately rather than being absorbed into a budget.
+        run: npm run lint -- --max-warnings=0
+
+  # ── Job 2: Unit tests ──────────────────────────────────────────────
+  test:
+    name: Jest
+    runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+      JWT_SECRET: ci-test-secret-not-real
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_619
+
+    services:
+      postgres:
+        # Matches production (PostgreSQL 17.6). CI previously ran 15, so two
+        # major versions of behaviour — collation, RLS, planner, and the
+        # extensions available — went untested until deploy.
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_619
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test -- --passWithNoTests
+
+  # ── Job 3: Security audit ──────────────────────────────────────────
+  security:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Audit dependencies
+        # Clean as of the brace-expansion override in package.json. When a new
+        # advisory lands, prefer `overrides` for a transitive dependency over
+        # loosening this threshold.
+        run: npm audit --audit-level=high

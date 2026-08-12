@@ -1,0 +1,223 @@
+name: Deploy Backend to VPS
+
+# Runs only after CI has PASSED on main — and on demand.
+#
+# It used to trigger on `push: main` directly. So did ci.yml, which meant the
+# two raced: a commit that failed lint, tests or `npm audit` still deployed,
+# because nothing connected the pipelines. The test suite was advisory.
+#
+# `workflow_run` is the fix. It fires when the named workflow COMPLETES, and
+# the job-level `if` below requires a successful conclusion, so a red CI run
+# ends the pipeline instead of shipping.
+#
+# `workflow_dispatch` stays: a deploy that can only be triggered by a commit is
+# a deploy you cannot repeat. When an infrastructure blip fails the run, main
+# stays undeployed until somebody happens to push again; the "Run workflow"
+# button redeploys whatever main currently is. A manual dispatch deliberately
+# skips the gate — it is the break-glass path, and the operator pressing it can
+# see CI's state for themselves.
+on:
+  workflow_run:
+    workflows: ["CI — Lint · Test · Audit"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+# The script lives here so the three attempts below cannot drift apart. It is
+# idempotent — pull, build, migrate, up -d — so running it twice is the same as
+# running it once.
+env:
+  DEPLOY_SCRIPT: |
+    set -e
+    cd /opt/myptstudio/619-erp-backend
+
+    # `checkout main` before pulling, because rollback.yml leaves the checkout
+    # DETACHED at the rolled-back commit. A bare `git pull origin main` against
+    # a detached HEAD does not move it, so the next deploy after a rollback
+    # would report success and ship nothing. --ff-only fails loudly rather than
+    # creating a merge commit or quietly discarding anything edited on the box.
+    git fetch origin main
+    git checkout main
+    git pull --ff-only origin main
+
+    # Record what is currently serving BEFORE we move, so rollback.yml has a
+    # target that does not require reading the deploy log. Written on the box
+    # rather than in CI because the box is the thing that can be rolled back.
+    git rev-parse HEAD > /opt/myptstudio/.backend-deployed-sha.new
+
+    cd /opt/myptstudio
+
+    docker compose build backend
+
+    # Apply migrations BEFORE the new container serves traffic.
+    #
+    # This step did not exist. `npm run migrate` was a manual, out-of-band
+    # action, which is how the live schema drifted from the tracked migrations
+    # in at least 16 documented places — and it meant a deploy could ship code
+    # expecting a column the database did not have yet.
+    #
+    # `run --rm --no-deps` uses the freshly built image and its env (so
+    # DATABASE_URL comes from the same place the app reads it) without starting
+    # or restarting the serving container. With `set -e` and `script_stop`, a
+    # failed migration aborts the deploy and leaves the OLD container running
+    # — the correct failure mode, since a half-migrated database serving new
+    # code is worse than a delayed release.
+    docker compose run --rm --no-deps backend npm run migrate
+
+    docker compose up -d backend
+
+    # Only now is the new SHA actually serving.
+    mv /opt/myptstudio/.backend-deployed-sha.new /opt/myptstudio/.backend-deployed-sha
+
+    docker image prune -f
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    # The gate. On workflow_run this requires CI to have concluded 'success';
+    # a manual dispatch bypasses it deliberately (see the header).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Report what is being deployed and why it was allowed
+        run: |
+          echo "Trigger:    ${{ github.event_name }}"
+          echo "CI result:  ${{ github.event.workflow_run.conclusion || 'n/a (manual dispatch)' }}"
+          echo "Commit:     ${{ github.event.workflow_run.head_sha || github.sha }}"
+
+      # ── Why there are four attempts ─────────────────────────────────────
+      #
+      # The runner intermittently cannot reach the VPS on 22:
+      #
+      #   2026/08/05 06:14:53 dial tcp ***:22: i/o timeout
+      #
+      # An `i/o timeout` means the TCP handshake never completed — the packets
+      # were dropped, not refused. A wrong key gives a rejection, a wrong host
+      # gives a DNS error; this is a filter or a box that is not answering.
+      #
+      # The ladder has been widened twice by evidence, and the comment that
+      # used to sit here claimed seven minutes "covers every occurrence seen so
+      # far". That is no longer true, so it is corrected rather than kept:
+      #
+      #   05 Aug  outage swallowed 07:17 and 07:20, over by 07:27  (~10 min)
+      #   08 Aug  swallowed all three frontend attempts at 06:43, 06:46 and
+      #           06:52, on a box that had deployed fine at 06:05  (>10 min)
+      #
+      # Three attempts at 0s, +90s and +5min span about seven minutes, and the
+      # 08 Aug outage outlasted them. A fourth at +15min takes the ladder to
+      # roughly twenty-two, which covers both observed windows with margin. A
+      # job may run for six hours, so the cost of the extra wait is only paid
+      # on a day that was already broken.
+      #
+      # `continue-on-error` keeps each failure from ending the job; the last
+      # attempt has none, so it decides the outcome. This hides a blip, not an
+      # outage — and the diagnostic step below fires when the whole ladder
+      # fails, so the next occurrence says WHAT was unreachable instead of
+      # only that something was.
+      - name: Deploy to VPS via SSH
+        id: attempt
+        continue-on-error: true
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          # Default is 30s. The observed failures took the full 30 and then
+          # gave up; the box answers again shortly after.
+          timeout: 60s
+          # A cold `docker compose build` is minutes, and the default 10m has
+          # no margin on a busy box.
+          command_timeout: 20m
+          # Default is OFF, which means the run's exit code is the LAST
+          # command's — `docker image prune -f` — so a failed `git pull` would
+          # report a green deploy that shipped nothing. Stop at the first error.
+          script_stop: true
+          script: ${{ env.DEPLOY_SCRIPT }}
+
+      - name: Wait for the box to answer again
+        if: steps.attempt.outcome == 'failure'
+        run: sleep 90
+
+      - name: Deploy to VPS via SSH (retry 1)
+        id: retry1
+        continue-on-error: true
+        if: steps.attempt.outcome == 'failure'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 20m
+          script_stop: true
+          script: ${{ env.DEPLOY_SCRIPT }}
+
+      - name: Wait longer
+        if: steps.attempt.outcome == 'failure' && steps.retry1.outcome == 'failure'
+        run: sleep 300
+
+      - name: Deploy to VPS via SSH (retry 2)
+        id: retry2
+        continue-on-error: true
+        if: steps.attempt.outcome == 'failure' && steps.retry1.outcome == 'failure'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 20m
+          script_stop: true
+          script: ${{ env.DEPLOY_SCRIPT }}
+
+      - name: Wait out a longer outage
+        if: >-
+          steps.attempt.outcome == 'failure' && steps.retry1.outcome == 'failure'
+          && steps.retry2.outcome == 'failure'
+        run: sleep 900
+
+      # The last attempt has no continue-on-error: it decides the job.
+      - name: Deploy to VPS via SSH (retry 3)
+        if: >-
+          steps.attempt.outcome == 'failure' && steps.retry1.outcome == 'failure'
+          && steps.retry2.outcome == 'failure'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 20m
+          script_stop: true
+          script: ${{ env.DEPLOY_SCRIPT }}
+
+      # ── What was actually unreachable ───────────────────────────────────
+      #
+      # `dial tcp ***:22: i/o timeout` says a port did not answer. It does not
+      # say whether the box is down, whether only 22 is filtered, or whether
+      # the runner's egress is the problem — and those have three different
+      # fixes. Every failure so far has left us guessing between them.
+      #
+      # This probes 22, 80 and 443 and prints the result. If 443 answers while
+      # 22 times out, the box is serving and something is filtering SSH
+      # (firewall rule, fail2ban, provider-side block) — check `ufw status`,
+      # `fail2ban-client status sshd` and the provider console. If nothing
+      # answers, the box or its network is down. It never fails the job: the
+      # deploy result above is the outcome, this is only evidence.
+      - name: Diagnose what the VPS is answering on
+        if: failure()
+        continue-on-error: true
+        run: |
+          for port in 22 80 443; do
+            if timeout 10 bash -c "cat < /dev/null > /dev/tcp/${{ secrets.HOST }}/$port" 2>/dev/null; then
+              echo "port $port: OPEN"
+            else
+              echo "port $port: no answer within 10s"
+            fi
+          done
+          echo "If 443 is open and 22 is not, the box is up and SSH is being filtered."
+          echo "If none are open, the box or its network is down."
+

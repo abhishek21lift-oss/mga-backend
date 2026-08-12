@@ -1,0 +1,87 @@
+name: Rollback Backend
+
+# Put a known-good commit back on the box, without waiting for a revert to
+# travel through main and CI.
+#
+# Before this existed there was no rollback path at all: no image tags, no
+# registry, no previous-version reference anywhere. Undoing a bad deploy meant
+# reverting the commit, pushing, and sitting through the same full rebuild as a
+# forward deploy — the slowest possible response to the moment you most need a
+# fast one.
+#
+# This deploys a specific SHA directly. It is deliberately manual and
+# deliberately unguarded by CI: you reach for it when main is broken, so
+# requiring main's pipeline to be green first would defeat the point.
+#
+# ── What this does NOT do ───────────────────────────────────────────────────
+#
+# It does not roll the DATABASE back. Migrations are forward-only here, and
+# there is no down-migration tooling. If the deploy you are undoing applied a
+# migration, rolling the code back leaves the newer schema in place. That is
+# usually fine — the additive migrations this repo writes (ADD COLUMN IF NOT
+# EXISTS, CREATE INDEX, ENABLE RLS) are readable by the older code — but a
+# migration that dropped or renamed something is NOT recoverable this way and
+# needs a hand-written forward fix instead. The confirmation input below exists
+# so nobody discovers that mid-incident.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Full or short git SHA to roll back to (must exist on origin/main)'
+        required: true
+        type: string
+      confirm:
+        description: 'Type ROLLBACK to confirm. Read the schema note in this file first.'
+        required: true
+        type: string
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Refuse unless explicitly confirmed
+        if: inputs.confirm != 'ROLLBACK'
+        run: |
+          echo "::error::Confirmation not given. Type ROLLBACK in the confirm field."
+          exit 1
+
+      - name: Roll the box back to the requested commit
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          timeout: 60s
+          command_timeout: 20m
+          script_stop: true
+          script: |
+            set -e
+            cd /opt/myptstudio/619-erp-backend
+
+            echo "Currently deployed: $(cat /opt/myptstudio/.backend-deployed-sha 2>/dev/null || echo unknown)"
+            echo "Rolling back to:    ${{ inputs.sha }}"
+
+            git fetch origin main
+
+            # Fail before touching anything if the SHA is not real. A typo here
+            # would otherwise leave the checkout in a detached, arbitrary state.
+            git cat-file -e "${{ inputs.sha }}^{commit}" || {
+              echo "No such commit: ${{ inputs.sha }}"
+              exit 1
+            }
+
+            git checkout --detach "${{ inputs.sha }}"
+
+            cd /opt/myptstudio
+            docker compose build backend
+            docker compose up -d backend
+
+            git -C /opt/myptstudio/619-erp-backend rev-parse HEAD \
+              > /opt/myptstudio/.backend-deployed-sha
+
+            echo "Rolled back. The checkout is now DETACHED — the next normal"
+            echo "deploy runs 'git pull origin main', which will not move a"
+            echo "detached HEAD. Run:  git checkout main  on the box once main"
+            echo "carries the fix, or the next deploy will silently no-op."

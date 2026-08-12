@@ -1,0 +1,148 @@
+# Production topology for the Hostinger VPS: Redis, API, queue workers.
+#
+# ── Why this file exists ────────────────────────────────────────────────────
+#
+# BullMQ landed in #38 with everything it needs in the application — queues,
+# five workers, health checks, graceful shutdown, and a fallback to inline
+# sends when Redis is absent. The only topology file this repo ever had described
+# a hosting platform the app does not run on.
+# Nothing described it for the VPS, which is where the app actually runs.
+#
+# Without a `redis` service, REDIS_URL stays unset on the box and every queue
+# silently degrades to the pre-queue inline path. That is a safe state — it is
+# the reason #38 could ship — but it means none of the queue work does
+# anything in production. This file is the missing half.
+#
+# ── Read this before deploying ──────────────────────────────────────────────
+#
+# The compose file that actually runs lives on the VPS at
+# /opt/myptstudio/619-erp-backend/, outside this repository, and deploy.sh
+# uses it. Committing this here does NOT change that file. Reconcile it by
+# hand, or copy this over it after checking the volume and network names match
+# what is already there.
+#
+# ── Secrets ─────────────────────────────────────────────────────────────────
+#
+# Nothing here carries a value. Every variable is read from the environment or
+# the .env file sitting beside this on the box. The `${VAR}` form with no
+# default means compose fails loudly on a missing one rather than starting the
+# API with a blank database URL; `${VAR:-}` marks the genuinely optional ones.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Loopback only. The queue is internal, nginx does not proxy to it, and a
+    # Redis reachable from the internet is how a box ends up mining somebody
+    # else's cryptocurrency.
+    ports:
+      - '127.0.0.1:6379:6379'
+    command:
+      # appendonly so a restart does not lose queued jobs. A queue that empties
+      # on reboot is not a queue.
+      - redis-server
+      - --appendonly
+      - 'yes'
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-256mb}
+      # noeviction, NOT allkeys-lru. Under memory pressure an LRU policy would
+      # evict job hashes — silently deleting queued work. BullMQ would far
+      # rather be told the write failed.
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:5000:5000'
+    environment:
+      NODE_ENV: production
+      PORT: '5000'
+      # `redis` is the service name; inside the compose network it resolves to
+      # the container. This is also lib/redis.js's DEFAULT_HOST, so the two
+      # agree by construction rather than by coincidence.
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      # 0 because the `worker` service below drains the queues. Both draining
+      # would mean two processes competing for every job — which BullMQ
+      # handles correctly, but doubles the load for no throughput on a box
+      # this size. Set to 1 and drop the worker service to run single-process.
+      RUN_WORKERS: '0'
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      FRONTEND_URL: ${FRONTEND_URL}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # The queue workers, as their own service.
+  #
+  # Separate from the API because embedding a PDF pins a core for tens of
+  # seconds, and doing that inside the process serving requests degrades every
+  # studio at once. RUN_WORKERS=1 on the api service is the single-container
+  # alternative if this box cannot spare a second one.
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ['node', 'src/workers/index.js']
+    # The image's HEALTHCHECK wgets /api/health, and this container runs no
+    # HTTP server — it would sit permanently unhealthy and make `docker
+    # compose ps` useless for spotting a real problem. Liveness here is the
+    # process being up, which restart:unless-stopped already covers.
+    healthcheck:
+      disable: true
+    environment:
+      NODE_ENV: production
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      # Explicit, though src/workers/index.js is the worker entrypoint and does
+      # not read this: it documents that THIS is the process that drains.
+      RUN_WORKERS: '1'
+      DATABASE_URL: ${DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      FRONTEND_URL: ${FRONTEND_URL}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      # The worker sends WhatsApp and charges renewals; the API does not.
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_WHATSAPP_FROM: ${TWILIO_WHATSAPP_FROM:-}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      # AI ingestion reads uploaded files back out of object storage.
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    depends_on:
+      redis:
+        condition: service_healthy
+    # 30s rather than the default 10. The workers drain in-flight jobs on
+    # SIGTERM, and being SIGKILLed mid-drain is exactly what the drain exists
+    # to prevent — for the renewal queue that is a card charged with no
+    # membership row written.
+    stop_grace_period: 30s
+
+volumes:
+  redis-data:
