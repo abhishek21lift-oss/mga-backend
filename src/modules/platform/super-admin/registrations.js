@@ -16,7 +16,7 @@
  */
 
 const {
-  EMAIL_RE, audit, bcrypt, crypto, logger, pool, slugify, uniqueSlug,
+  EMAIL_RE, audit, bcrypt, crypto, logger, platformPool, pool, slugify, uniqueSlug,
 } = require('./shared');
 
 /** The trial the landing page advertises. Deliberately not the 7-day TRIAL_DAYS. */
@@ -145,12 +145,16 @@ async function list(req, res, next) {
     let where = '';
     if (status !== 'all') { params.push(status); where = 'WHERE status = $1'; }
 
-    const { rows } = await pool.query(
+    // Platform pool from here down. studio_registrations is scoped strictly by
+    // 157 and a platform operator has no organisation, so as app_tenant every
+    // query below returns nothing — the queue looked empty while applications
+    // sat in it. 163 grants app_platform SELECT and a narrowed UPDATE.
+    const { rows } = await platformPool.query(
       `SELECT ${PUBLIC_COLUMNS} FROM studio_registrations ${where}
         ORDER BY created_at DESC LIMIT 200`,
       params
     );
-    const { rows: counts } = await pool.query(
+    const { rows: counts } = await platformPool.query(
       `SELECT status, count(*)::int AS n FROM studio_registrations GROUP BY status`
     );
     res.json({
@@ -168,7 +172,12 @@ async function list(req, res, next) {
  * account nobody can log into and nobody can see is broken.
  */
 async function approveHandler(req, res, next) {
-  const client = await pool.connect();
+  // Borrowed from the platform pool, so the whole approval transaction —
+  // organizations, subscription_events, trainers, users, studio_registrations —
+  // runs as app_platform. It cannot run as app_tenant: organizations carries
+  // only 131's deny-all for that role, and every other insert carries a
+  // brand-new organisation id that no app.org_id could match.
+  const client = await platformPool.connect();
   try {
     const { rows: appRows } = await client.query(
       'SELECT * FROM studio_registrations WHERE id = $1',
@@ -277,7 +286,7 @@ async function approveHandler(req, res, next) {
 async function rejectHandler(req, res, next) {
   try {
     const note = String(req.body?.note || '').slice(0, 500) || null;
-    const { rows } = await pool.query(
+    const { rows } = await platformPool.query(
       `UPDATE studio_registrations
           SET status = 'rejected', password_hash = NULL, reviewed_at = now(),
               reviewed_by = $2, review_note = $3, updated_at = now()

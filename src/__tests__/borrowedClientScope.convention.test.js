@@ -46,15 +46,33 @@ const OUTSIDE_A_REQUEST = {
   'src/db/pool.js': 'the startup connectivity probe, and the wrapper\'s own plumbing',
 };
 
-/** Collect every pool.connect() borrow and whether its body opens a transaction. */
+/**
+ * Collect every borrow and whether its body opens a transaction.
+ *
+ * Both pools are counted. platformPool.connect() (migration 163) is a borrow
+ * from the app_platform role, and it is deliberately NOT tenant-scoped —
+ * a platform request has no organisation, so there is no app.org_id to set.
+ * It is still counted here because the transaction rule below applies to it
+ * just as much: registration approval writes five tables and a partial studio
+ * is worse than none. Matching only the tenant pool would have quietly
+ * dropped those borrows out of this guard's sight the moment they moved.
+ */
 function borrows() {
   const found = [];
   for (const file of sources()) {
     const lines = fs.readFileSync(file, 'utf8').split('\n');
     lines.forEach((line, i) => {
-      if (!/pool\.connect\(\)/.test(line)) return;
+      // All three tiers by name: the migration pool (mpool, in migrate.js),
+      // the platform pool, and the tenant pool. `mpool` used to be counted
+      // only by accident — the previous pattern had no word boundary, so
+      // "mpool.connect()" matched as a substring of itself. Naming them makes
+      // the set deliberate, and means a fourth pool has to be added here
+      // rather than silently escaping the guard.
+      const m = line.match(/\b(platformPool|mpool|pool)\.connect\(\)/);
+      if (!m) return;
       // Comments describing the pattern are not borrows.
       if (/^\s*(\/\/|\*)/.test(line)) return;
+      const isPlatform = m[1] === 'platformPool';
 
       // Walk to the matching release(), which every borrow in this repo has.
       let begins = false;
@@ -62,7 +80,7 @@ function borrows() {
         if (/\.query\(\s*['"`]\s*(BEGIN|START TRANSACTION)/i.test(lines[j])) begins = true;
         if (/\.release\(\)/.test(lines[j])) break;
       }
-      found.push({ file: rel(file), line: i + 1, begins });
+      found.push({ file: rel(file), line: i + 1, begins, isPlatform });
     });
   }
   return found;

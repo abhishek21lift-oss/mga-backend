@@ -15,6 +15,10 @@ jest.mock('../db/pool', () => ({
     return { rows: [], rowCount: 1 };
   }),
 }));
+// audit() and every super-admin read moved to the platform pool (migration 163).
+// Same mock object, so assertions about what SQL a handler ran keep working;
+// which pool it used is asserted separately, in platformPool.tiers.test.js.
+jest.mock('../db/platformPool', () => require('../db/pool'));
 
 const pool = require('../db/pool');
 const { logActivity } = require('../lib/activityLog');

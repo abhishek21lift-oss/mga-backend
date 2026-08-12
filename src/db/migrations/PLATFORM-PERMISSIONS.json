@@ -1,0 +1,329 @@
+{
+  "note": "Derived from the live catalogue after migration 163. Regenerate rather than hand-edit.",
+  "role": "app_platform",
+  "attributes": {
+    "LOGIN": true,
+    "SUPERUSER": false,
+    "BYPASSRLS": false,
+    "CREATEDB": false,
+    "CREATEROLE": false,
+    "REPLICATION": false,
+    "CREATE_ON_PUBLIC": false
+  },
+  "sequences": [
+    {
+      "name": "seq_trn_id",
+      "privilege": "USAGE",
+      "why": "trainers.unique_id trigger calls nextval during studio provisioning"
+    }
+  ],
+  "tables": [
+    {
+      "table": "_migrations",
+      "grants": [
+        "SELECT"
+      ],
+      "policies": "platform_select:SELECT"
+    },
+    {
+      "table": "activity_log",
+      "grants": [
+        "INSERT",
+        "SELECT"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT"
+    },
+    {
+      "table": "admin_invitations",
+      "grants": [
+        "INSERT",
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "ai_model_rates",
+      "grants": [
+        "INSERT",
+        "SELECT"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT"
+    },
+    {
+      "table": "ai_platform_settings",
+      "grants": [
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "ai_usage_log",
+      "grants": [
+        "SELECT"
+      ],
+      "policies": "platform_select:SELECT"
+    },
+    {
+      "table": "attendance_logs",
+      "grants": [
+        "SELECT"
+      ],
+      "policies": "platform_select:SELECT"
+    },
+    {
+      "table": "founder_members",
+      "grants": [
+        "INSERT",
+        "SELECT"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT"
+    },
+    {
+      "table": "login_events",
+      "grants": [
+        "SELECT"
+      ],
+      "policies": "platform_select:SELECT"
+    },
+    {
+      "table": "notifications",
+      "grants": [
+        "INSERT",
+        "SELECT"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT"
+    },
+    {
+      "table": "organization_ai_limits",
+      "grants": [
+        "DELETE",
+        "INSERT",
+        "SELECT"
+      ],
+      "policies": "platform_delete:DELETE platform_insert:INSERT platform_select:SELECT"
+    },
+    {
+      "table": "organization_features",
+      "grants": [
+        "DELETE",
+        "INSERT",
+        "SELECT"
+      ],
+      "policies": "platform_delete:DELETE platform_insert:INSERT platform_select:SELECT"
+    },
+    {
+      "table": "organizations",
+      "grants": [
+        "INSERT",
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "plan_features",
+      "grants": [
+        "INSERT",
+        "SELECT"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT"
+    },
+    {
+      "table": "platform_ai_settings",
+      "grants": [
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "platform_announcements",
+      "grants": [
+        "DELETE",
+        "INSERT",
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_delete:DELETE platform_insert:INSERT platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "platform_billing_settings",
+      "grants": [
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "platform_features",
+      "grants": [
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "platform_payment_settings",
+      "grants": [
+        "INSERT",
+        "SELECT"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT"
+    },
+    {
+      "table": "pt_clients",
+      "grants": [
+        "SELECT"
+      ],
+      "policies": "platform_select:SELECT"
+    },
+    {
+      "table": "pt_sessions",
+      "grants": [
+        "SELECT"
+      ],
+      "policies": "platform_select:SELECT"
+    },
+    {
+      "table": "refresh_tokens",
+      "grants": [
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "storage_accounting_meta",
+      "grants": [
+        "SELECT"
+      ],
+      "policies": "platform_select:SELECT"
+    },
+    {
+      "table": "storage_objects",
+      "grants": [
+        "SELECT"
+      ],
+      "policies": "platform_select:SELECT"
+    },
+    {
+      "table": "studio_registrations",
+      "grants": [
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "subscription_coupon_redemptions",
+      "grants": [
+        "INSERT",
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "subscription_coupons",
+      "grants": [
+        "DELETE",
+        "INSERT",
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_delete:DELETE platform_insert:INSERT platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "subscription_events",
+      "grants": [
+        "INSERT",
+        "SELECT"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT"
+    },
+    {
+      "table": "subscription_invoices",
+      "grants": [
+        "INSERT",
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "subscription_payment_requests",
+      "grants": [
+        "INSERT",
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "subscription_payments",
+      "grants": [
+        "INSERT",
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "subscription_plans",
+      "grants": [
+        "SELECT"
+      ],
+      "policies": "platform_select:SELECT"
+    },
+    {
+      "table": "support_ticket_messages",
+      "grants": [
+        "INSERT",
+        "SELECT"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT"
+    },
+    {
+      "table": "support_tickets",
+      "grants": [
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "trainers",
+      "grants": [
+        "INSERT",
+        "SELECT"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT"
+    },
+    {
+      "table": "trials",
+      "grants": [
+        "SELECT"
+      ],
+      "policies": "platform_select:SELECT"
+    },
+    {
+      "table": "user_profiles",
+      "grants": [
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_select:SELECT platform_update:UPDATE"
+    },
+    {
+      "table": "users",
+      "grants": [
+        "INSERT",
+        "SELECT",
+        "UPDATE"
+      ],
+      "policies": "platform_insert:INSERT platform_select:SELECT platform_update:UPDATE"
+    }
+  ]
+}

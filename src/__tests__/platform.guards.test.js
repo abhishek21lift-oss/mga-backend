@@ -16,6 +16,10 @@ const request = require('supertest');
 process.env.JWT_SECRET = 'test-secret-at-least-32-characters-long!!';
 
 jest.mock('../db/pool', () => ({ query: jest.fn() }));
+// audit() and every super-admin read moved to the platform pool (migration 163).
+// Same mock object, so assertions about what SQL a handler ran keep working;
+// which pool it used is asserted separately, in platformPool.tiers.test.js.
+jest.mock('../db/platformPool', () => require('../db/pool'));
 const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
 

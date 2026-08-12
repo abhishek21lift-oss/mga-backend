@@ -17,6 +17,10 @@
  */
 
 jest.mock('../db/pool', () => ({ query: jest.fn() }));
+// audit() and every super-admin read moved to the platform pool (migration 163).
+// Same mock object, so assertions about what SQL a handler ran keep working;
+// which pool it used is asserted separately, in platformPool.tiers.test.js.
+jest.mock('../db/platformPool', () => require('../db/pool'));
 jest.mock('bcryptjs', () => ({ hash: jest.fn().mockResolvedValue('$2b$12$mockmockmockmockmockmo') }));
 
 const pool = require('../db/pool');

@@ -35,11 +35,14 @@
  * either.
  */
 
-const crypto = require('crypto');
 const { Client } = require('pg');
+// Shared with provision-app-platform-password.js: one SCRAM implementation to
+// get right, not one per role. See scripts/lib/scram.js for why the hashing
+// happens here rather than on the server.
+const { scramVerifier, DEFAULT_ITERATIONS } = require('./lib/scram');
 
 const ROLE = 'app_tenant';
-const SCRAM_ITERATIONS = 4096;          // PostgreSQL's own default
+const SCRAM_ITERATIONS = DEFAULT_ITERATIONS;
 const MIN_PASSWORD_LENGTH = 16;
 
 const fail = (msg) => { console.error(`✗ ${msg}`); process.exit(1); };
@@ -69,23 +72,6 @@ if (!/^[\x21-\x7e]+$/.test(password)) {
 // be percent-encoded in DATABASE_URL, and the script prints the encoded form
 // of the *username* only, never the password.
 const NEEDS_ENCODING = /[:/?#[\]@%&=+$,; ]/.test(password);
-
-/**
- * Build a PostgreSQL SCRAM-SHA-256 verifier, the exact string the server would
- * have stored had it hashed the password itself. Format is documented in
- * src/backend/libpq/crypt.c:
- *
- *   SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>   (base64)
- */
-function scramVerifier(plaintext, iterations) {
-  const salt = crypto.randomBytes(16);
-  const saltedPassword = crypto.pbkdf2Sync(plaintext, salt, iterations, 32, 'sha256');
-  const clientKey = crypto.createHmac('sha256', saltedPassword).update('Client Key').digest();
-  const storedKey = crypto.createHash('sha256').update(clientKey).digest();
-  const serverKey = crypto.createHmac('sha256', saltedPassword).update('Server Key').digest();
-  return `SCRAM-SHA-256$${iterations}:${salt.toString('base64')}$`
-       + `${storedKey.toString('base64')}:${serverKey.toString('base64')}`;
-}
 
 const ssl = (u) => (/sslmode=disable/.test(u) ? false : { rejectUnauthorized: false });
 

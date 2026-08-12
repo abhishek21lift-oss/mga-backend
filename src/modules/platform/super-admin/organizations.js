@@ -7,12 +7,12 @@
 
 const router = require('express').Router();
 const {
-  EMAIL_RE, TENANT_ROLES, TRIAL_DAYS, audit, bcrypt, crypto, deliverInvitation, detectLogoType, invalidateUserCache, invitations, logger, logoUpload, pool, saveFile, sendPasswordReset, slugify, smtpConfigured, uniqueSlug,
+  EMAIL_RE, TENANT_ROLES, TRIAL_DAYS, audit, bcrypt, crypto, deliverInvitation, detectLogoType, invalidateUserCache, invitations, logger, logoUpload, platformPool, saveFile, sendPasswordReset, slugify, smtpConfigured, uniqueSlug,
 } = require('./shared');
 // ── GET /organizations ───────────────────────────────────────────────────────
 router.get('/organizations', async (req, res, next) => {
   try {
-    const { rows } = await pool.query(`
+    const { rows } = await platformPool.query(`
       SELECT o.id, o.name, o.slug, o.status, o.created_at,
              (SELECT count(*) FROM users u    WHERE u.organization_id = o.id AND u.deleted_at IS NULL)    AS user_count,
              (SELECT count(*) FROM trainers t WHERE t.organization_id = o.id AND t.deleted_at IS NULL)     AS trainer_count,
@@ -28,9 +28,9 @@ router.get('/organizations', async (req, res, next) => {
 // ── GET /organizations/:id ────────────────────────────────────────────────────
 router.get('/organizations/:id', async (req, res, next) => {
   try {
-    const { rows: orgs } = await pool.query('SELECT * FROM organizations WHERE id = $1', [req.params.id]);
+    const { rows: orgs } = await platformPool.query('SELECT * FROM organizations WHERE id = $1', [req.params.id]);
     if (!orgs.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Organization not found' } });
-    const { rows: users } = await pool.query(
+    const { rows: users } = await platformPool.query(
       `SELECT id, name, email, role, trainer_id, is_active, last_login, created_at
          FROM users WHERE organization_id = $1 AND deleted_at IS NULL ORDER BY created_at`,
       [req.params.id]
@@ -44,7 +44,7 @@ router.get('/organizations/:id', async (req, res, next) => {
 // trainer record, and the trainer's login (role='admin' — full control of
 // their own isolated workspace; the platform god is role='super_admin').
 router.post('/organizations', async (req, res, next) => {
-  const client = await pool.connect();
+  const client = await platformPool.connect();
   try {
     const orgName = String(req.body.name || '').trim();
     const trainerName = String(req.body.trainer_name || orgName).trim();
@@ -80,7 +80,7 @@ router.post('/organizations', async (req, res, next) => {
       });
     }
 
-    const { rows: dupe } = await pool.query('SELECT 1 FROM users WHERE LOWER(email) = $1', [email]);
+    const { rows: dupe } = await platformPool.query('SELECT 1 FROM users WHERE LOWER(email) = $1', [email]);
     if (dupe.length) return res.status(409).json({ error: { code: 'CONFLICT', message: 'That login email is already in use' } });
 
     const slug = await uniqueSlug(slugify(orgName));
@@ -193,19 +193,19 @@ router.patch('/organizations/:id', async (req, res, next) => {
     if (!sets.length) return res.status(400).json({ error: { code: 'VALIDATION', message: 'Nothing to update' } });
     sets.push('updated_at = now()');
 
-    const { rows } = await pool.query(
+    const { rows } = await platformPool.query(
       `UPDATE organizations SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params
     );
     if (!rows.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Organization not found' } });
 
     if (status === 'suspended') {
-      await pool.query(
+      await platformPool.query(
         `UPDATE users SET is_active = false, token_version = token_version + 1 WHERE organization_id = $1`,
         [req.params.id]
       );
       invalidateUserCache();
     } else if (status === 'active') {
-      await pool.query(
+      await platformPool.query(
         `UPDATE users SET is_active = true, token_version = token_version + 1 WHERE organization_id = $1`,
         [req.params.id]
       );
@@ -224,7 +224,7 @@ router.patch('/organizations/:id', async (req, res, next) => {
 // Platform (super_admin) accounts cannot be edited through this portal.
 router.patch('/users/:id', async (req, res, next) => {
   try {
-    const { rows: existing } = await pool.query(
+    const { rows: existing } = await platformPool.query(
       `SELECT id, role FROM users WHERE id = $1 AND deleted_at IS NULL`, [req.params.id]
     );
     if (!existing.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'User not found' } });
@@ -245,7 +245,7 @@ router.patch('/users/:id', async (req, res, next) => {
     if (email !== undefined) {
       const v = String(email).trim().toLowerCase();
       if (!EMAIL_RE.test(v)) return res.status(400).json({ error: { code: 'VALIDATION', message: 'A valid email is required' } });
-      const { rows: dupe } = await pool.query('SELECT 1 FROM users WHERE LOWER(email) = $1 AND id <> $2', [v, req.params.id]);
+      const { rows: dupe } = await platformPool.query('SELECT 1 FROM users WHERE LOWER(email) = $1 AND id <> $2', [v, req.params.id]);
       if (dupe.length) return res.status(409).json({ error: { code: 'CONFLICT', message: 'That email is already in use' } });
       params.push(v); sets.push(`email = $${params.length}`);
     }
@@ -261,7 +261,7 @@ router.patch('/users/:id', async (req, res, next) => {
     if (securityChange) sets.push('token_version = token_version + 1');
     sets.push('updated_at = now()');
 
-    const { rows } = await pool.query(
+    const { rows } = await platformPool.query(
       `UPDATE users SET ${sets.join(', ')}
         WHERE id = $1 AND deleted_at IS NULL
         RETURNING id, name, email, role, organization_id, is_active`,
@@ -278,7 +278,7 @@ router.patch('/users/:id', async (req, res, next) => {
 // Add another login account to a studio (beyond the owner created with the org).
 router.post('/organizations/:id/users', async (req, res, next) => {
   try {
-    const { rows: orgs } = await pool.query('SELECT id FROM organizations WHERE id = $1', [req.params.id]);
+    const { rows: orgs } = await platformPool.query('SELECT id FROM organizations WHERE id = $1', [req.params.id]);
     if (!orgs.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Organization not found' } });
 
     const name = String(req.body.name || '').trim();
@@ -291,12 +291,12 @@ router.post('/organizations/:id/users', async (req, res, next) => {
     if (password.length < 8) return res.status(400).json({ error: { code: 'VALIDATION', message: 'Password must be at least 8 characters' } });
     if (!TENANT_ROLES.includes(role)) return res.status(400).json({ error: { code: 'VALIDATION', message: `role must be one of: ${TENANT_ROLES.join(', ')}` } });
 
-    const { rows: dupe } = await pool.query('SELECT 1 FROM users WHERE LOWER(email) = $1', [email]);
+    const { rows: dupe } = await platformPool.query('SELECT 1 FROM users WHERE LOWER(email) = $1', [email]);
     if (dupe.length) return res.status(409).json({ error: { code: 'CONFLICT', message: 'That email is already in use' } });
 
     const hashed = await bcrypt.hash(password, 12);
     const userId = crypto.randomUUID();
-    const { rows } = await pool.query(
+    const { rows } = await platformPool.query(
       `INSERT INTO users (id, name, email, password, role, organization_id, is_active)
        VALUES ($1,$2,$3,$4,$5,$6,true)
        RETURNING id, name, email, role, organization_id, is_active, created_at`,
@@ -315,7 +315,7 @@ router.delete('/users/:id', async (req, res, next) => {
     if (req.params.id === req.user?.id) {
       return res.status(400).json({ error: { code: 'VALIDATION', message: 'You cannot delete your own account' } });
     }
-    const { rows: existing } = await pool.query(
+    const { rows: existing } = await platformPool.query(
       `SELECT id, role, organization_id FROM users WHERE id = $1 AND deleted_at IS NULL`, [req.params.id]
     );
     if (!existing.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'User not found' } });
@@ -324,7 +324,7 @@ router.delete('/users/:id', async (req, res, next) => {
       return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Platform accounts cannot be deleted here' } });
     }
     if (target.role === 'admin' && target.organization_id) {
-      const { rows: [{ count }] } = await pool.query(
+      const { rows: [{ count }] } = await platformPool.query(
         `SELECT count(*)::int AS count FROM users
           WHERE organization_id = $1 AND role = 'admin' AND is_active = true AND deleted_at IS NULL AND id <> $2`,
         [target.organization_id, req.params.id]
@@ -333,7 +333,7 @@ router.delete('/users/:id', async (req, res, next) => {
         return res.status(409).json({ error: { code: 'LAST_ADMIN', message: "Cannot delete a studio's last active admin. Add another admin first." } });
       }
     }
-    await pool.query(
+    await platformPool.query(
       `UPDATE users SET deleted_at = now(), is_active = false, token_version = token_version + 1, updated_at = now()
         WHERE id = $1`,
       [req.params.id]
@@ -369,7 +369,7 @@ const PASSWORD_SETUP_EXPIRY_MINUTES = Math.min(
 
 router.post('/users/:id/send-password-setup', async (req, res, next) => {
   try {
-    const { rows: users } = await pool.query(
+    const { rows: users } = await platformPool.query(
       `SELECT id, name, email, role FROM users WHERE id = $1 AND deleted_at IS NULL`,
       [req.params.id]
     );
@@ -407,7 +407,7 @@ router.post('/users/:id/send-password-setup', async (req, res, next) => {
     // was shortened on purpose (auth.js, M-07), and is clamped to 15 minutes
     // either side of a day so a typo in the environment cannot make a
     // password-set link effectively permanent.
-    await pool.query(
+    await platformPool.query(
       `UPDATE users
           SET password_reset_token = $1,
               password_reset_expires = NOW() + ($2 || ' minutes')::interval
@@ -420,7 +420,7 @@ router.post('/users/:id/send-password-setup', async (req, res, next) => {
     } catch (err) {
       // Undo the token rather than leave a live one behind for a link that
       // never arrived — it would silently supersede any earlier valid link.
-      await pool.query(
+      await platformPool.query(
         `UPDATE users SET password_reset_token = NULL, password_reset_expires = NULL WHERE id = $1`,
         [user.id]
       ).catch(() => {});
@@ -464,7 +464,7 @@ router.post('/users/:id/reset-password', async (req, res, next) => {
     // stayed live for the rest of their 7-day window, so an operator resetting a
     // compromised account's password was told the sessions were gone while the
     // attacker could still mint new access tokens. The claim is now true.
-    const { rows } = await pool.query(
+    const { rows } = await platformPool.query(
       `WITH pw AS (
          UPDATE users SET password = $2, token_version = token_version + 1, updated_at = now()
            WHERE id = $1 AND deleted_at IS NULL
@@ -493,7 +493,7 @@ router.post('/organizations/:id/logo', logoUpload.single('file'), async (req, re
     if (!detected) {
       return res.status(400).json({ error: { code: 'VALIDATION', message: 'File is not a valid PNG, JPG, or WEBP image' } });
     }
-    const { rows: orgRows } = await pool.query('SELECT id FROM organizations WHERE id = $1', [req.params.id]);
+    const { rows: orgRows } = await platformPool.query('SELECT id FROM organizations WHERE id = $1', [req.params.id]);
     if (!orgRows.length) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Organization not found' } });
 
     const filename = `${req.params.id}-${Date.now()}.${detected.ext}`;
@@ -501,7 +501,7 @@ router.post('/organizations/:id/logo', logoUpload.single('file'), async (req, re
     // owner uploading it — bill the bytes to the studio.
     const url = await saveFile('org-logos', filename, req.file.buffer, detected.mime,
       { organizationId: req.params.id, uploadedBy: req.user?.id });
-    const { rows } = await pool.query(
+    const { rows } = await platformPool.query(
       'UPDATE organizations SET logo_url = $2, updated_at = now() WHERE id = $1 RETURNING *',
       [req.params.id, url]
     );

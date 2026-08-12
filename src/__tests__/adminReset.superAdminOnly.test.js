@@ -30,6 +30,10 @@ jest.mock('../middleware/auth', () => ({
 }));
 
 jest.mock('../db/pool', () => ({ query: jest.fn(async () => ({ rows: [] })), connect: jest.fn() }));
+// audit() and every super-admin read moved to the platform pool (migration 163).
+// Same mock object, so assertions about what SQL a handler ran keep working;
+// which pool it used is asserted separately, in platformPool.tiers.test.js.
+jest.mock('../db/platformPool', () => require('../db/pool'));
 jest.mock('../lib/email', () => ({ sendAdminResetOtp: jest.fn(async () => {}) }));
 
 const request = require('supertest');

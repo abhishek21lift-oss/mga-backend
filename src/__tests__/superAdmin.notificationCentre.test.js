@@ -6,6 +6,10 @@
 // a targeted audience with nothing in it is rejected rather than reaching
 // nobody and reporting success.
 jest.mock('../db/pool', () => ({ query: jest.fn(), connect: jest.fn() }));
+// audit() and every super-admin read moved to the platform pool (migration 163).
+// Same mock object, so assertions about what SQL a handler ran keep working;
+// which pool it used is asserted separately, in platformPool.tiers.test.js.
+jest.mock('../db/platformPool', () => require('../db/pool'));
 jest.mock('../lib/fileStorage', () => ({ saveFile: jest.fn() }));
 jest.mock('../lib/announcements', () => ({
   resolveRecipients: jest.fn(),

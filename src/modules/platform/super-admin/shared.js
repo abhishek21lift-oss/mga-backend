@@ -18,6 +18,13 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const pool = require('../../../db/pool');
+// Tier three. Every module in this directory sits behind auth +
+// requireSuperAdmin + requireSuperAdminMfa, so the helpers below run only for
+// platform operators and need cross-organisation reach that app_tenant does
+// not have. `pool` stays exported because one path here is genuinely
+// anonymous — public studio registration — and must keep using the tenant
+// role and its SECURITY DEFINER function (162).
+const platformPool = require('../../../db/platformPool');
 const logger = require('../../../lib/logger');
 const { saveFile } = require('../../../lib/fileStorage');
 const { invalidateUserCache } = require('../../../middleware/auth');
@@ -70,10 +77,17 @@ function slugify(name) {
     .slice(0, 48) || 'org';
 }
 
-async function uniqueSlug(base) {
+/**
+ * `runner` lets a caller inside a transaction check against uncommitted rows.
+ * approveHandler has always passed its borrowed client here; the parameter was
+ * missing, so the check silently ran on the pool instead — harmless while the
+ * connecting role was table-owning, and wrong the moment it was not, because
+ * app_tenant sees no organizations at all and every slug looked free.
+ */
+async function uniqueSlug(base, runner = platformPool) {
   let slug = base;
   for (let i = 0; i < 5; i++) {
-    const { rows } = await pool.query('SELECT 1 FROM organizations WHERE slug = $1', [slug]);
+    const { rows } = await runner.query('SELECT 1 FROM organizations WHERE slug = $1', [slug]);
     if (!rows.length) return slug;
     slug = `${base}-${crypto.randomBytes(2).toString('hex')}`;
   }
@@ -84,7 +98,9 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 async function audit(req, action, entityType, entityId, data) {
   try {
-    await pool.query(
+    // Platform pool: activity_log is tenant-scoped by 157, and a platform
+    // action has no organisation, so this write is impossible as app_tenant.
+    await platformPool.query(
       `INSERT INTO activity_log
          (user_id, user_name, action, entity_type, entity_id, new_data, ip_address, user_agent)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
@@ -153,6 +169,7 @@ module.exports = {
   detectLogoType,
   frontendUrl,
   invalidateUserCache,
+  platformPool,
   invitations,
   jwt,
   logger,
