@@ -191,3 +191,46 @@ jobs:
           echo "server did not answer /api/health within 45s"
           kill "$(cat /tmp/server.pid)" 2>/dev/null || true
           exit 1
+
+  # ── Job 5: RLS tenant isolation ────────────────────────────────────
+  #
+  # Runs as app_tenant (LOGIN, NOSUPERUSER, NOBYPASSRLS), which is the only
+  # way this proves anything. The application has always connected as a role
+  # that bypasses RLS, so every policy migration 157 generates has been
+  # decorative — present in the catalogue, never consulted. A suite run as
+  # postgres would pass while testing nothing, because postgres owns the
+  # tables and ignores their policies.
+  rls:
+    name: RLS tenant isolation (app_tenant)
+    runs-on: ubuntu-latest
+    env:
+      ADMIN_URL: postgresql://postgres:postgres@localhost:5432/postgres?sslmode=disable
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify tenant isolation as app_tenant
+        run: node scripts/rls-security-verify.js
