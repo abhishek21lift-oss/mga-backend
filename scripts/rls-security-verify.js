@@ -78,6 +78,34 @@ const urlFor = (db, user, pw) => {
 };
 const connect = async (url) => { const c = new Client({ connectionString: url }); await c.connect(); return c; };
 
+/**
+ * Run a statement that is *expected* to be refused, without losing the
+ * transaction.
+ *
+ * A policy violation raises, and PostgreSQL then aborts the whole
+ * transaction: every later statement returns 25P02 until rollback. That is
+ * precisely the shape of this suite — most assertions here are "this must be
+ * denied" — so a plain try/catch passes the first denial and then fails
+ * everything after it with a harness error rather than a result. Wrapping
+ * each attempt in a savepoint keeps the surrounding transaction, and its
+ * app.org_id, alive across an expected refusal.
+ *
+ * Returns { denied, rowCount, code }.
+ */
+async function attempt(c, sql, params = []) {
+  const sp = 'sp_' + crypto.randomBytes(4).toString('hex');
+  await c.query(`SAVEPOINT ${sp}`);
+  try {
+    const r = await c.query(sql, params);
+    await c.query(`RELEASE SAVEPOINT ${sp}`);
+    return { denied: false, rowCount: r.rowCount, code: null };
+  } catch (e) {
+    await c.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+    await c.query(`RELEASE SAVEPOINT ${sp}`);
+    return { denied: true, rowCount: 0, code: e.code };
+  }
+}
+
 /** Build a minimal INSERT for `table`, filling required columns with values
  *  the column's own type accepts. Returns null when the table needs something
  *  we cannot synthesise (a foreign key to a row we did not create). */
@@ -108,7 +136,14 @@ async function synthesise(admin, table, orgId) {
 
 (async () => {
   head('SETUP — fresh database, foundation + migrations');
-  {
+  // RLS_SKIP_BOOTSTRAP lets this run against a database somebody else built.
+  // The only reason it exists: the three pgvector migrations cannot apply on
+  // a workstation without the extension, so reproducing a harness fault
+  // locally would otherwise be impossible and every diagnosis would cost a
+  // CI round trip. CI never sets it.
+  if (process.env.RLS_SKIP_BOOTSTRAP === '1') {
+    note(`reusing existing database ${DB} (RLS_SKIP_BOOTSTRAP=1)`);
+  } else {
     const a = await connect(ADMIN_URL);
     await a.query(`DROP DATABASE IF EXISTS ${DB} WITH (FORCE)`);
     await a.query(`CREATE DATABASE ${DB}`);
@@ -117,12 +152,12 @@ async function synthesise(admin, table, orgId) {
                      THEN CREATE ROLE ${r} NOLOGIN; END IF; END $$;`);
     }
     await a.end();
+    execFileSync(process.execPath, [MIGRATE_JS], {
+      env: { ...process.env, DATABASE_URL: urlFor(DB) }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 15 * 60 * 1000,
+    });
+    emit('  migrations applied');
   }
-  execFileSync(process.execPath, [MIGRATE_JS], {
-    env: { ...process.env, DATABASE_URL: urlFor(DB) }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 15 * 60 * 1000,
-  });
-  emit('  migrations applied');
 
   const admin = await connect(urlFor(DB));
 
@@ -145,10 +180,16 @@ async function synthesise(admin, table, orgId) {
   }
 
   head('SETUP — two tenants');
+  // Run-scoped slugs so a repeated run against a reused database does not
+  // collide on organizations_slug_key, and so each run's fixtures are
+  // distinguishable from a previous run's leftovers.
+  const RUN = crypto.randomBytes(3).toString('hex');
   const { rows: [A] } = await admin.query(
-    `INSERT INTO organizations (name, slug, status) VALUES ('619 Fitness Studio','tenant-a-rls','active') RETURNING id`);
+    `INSERT INTO organizations (name, slug, status) VALUES ('619 Fitness Studio',$1,'active') RETURNING id`,
+    [`tenant-a-rls-${RUN}`]);
   const { rows: [B] } = await admin.query(
-    `INSERT INTO organizations (name, slug, status) VALUES ('ABC Fitness','tenant-b-rls','active') RETURNING id`);
+    `INSERT INTO organizations (name, slug, status) VALUES ('ABC Fitness',$1,'active') RETURNING id`,
+    [`tenant-b-rls-${RUN}`]);
   emit(`  tenant A ${A.id}\n  tenant B ${B.id}`);
 
   // Which tables actually carry a policy, and are strict (not the shared-row
@@ -235,16 +276,19 @@ async function synthesise(admin, table, orgId) {
     const t = usable[0].table;
     const forged = await synthesise(admin, t, B.id);
     await withOrg(c, A.id, async () => {
-      try { await c.query(forged.sql, forged.vals); bad('forged INSERT rejected', 'it succeeded'); }
-      catch (e) { ok('forged INSERT rejected', e.code === '42501' ? 'row-level security policy' : e.code); }
+      const f = await attempt(c, forged.sql, forged.vals);
+      f.denied
+        ? ok('forged INSERT rejected', f.code === '42501' ? 'row-level security policy' : f.code)
+        : bad('forged INSERT rejected', 'it succeeded');
+      // Same connection, same transaction: proves the savepoint left the
+      // tenant context intact after a refusal, not just that both work alone.
+      const own = await synthesise(admin, t, A.id);
+      const g = await attempt(c, own.sql, own.vals);
+      g.denied
+        ? bad('legitimate INSERT accepted after a refusal', g.code)
+        : ok('legitimate INSERT accepted after a refusal', t);
     });
-    const own = await synthesise(admin, t, A.id);
-    const c2 = await asTenant();
-    await withOrg(c2, A.id, async () => {
-      try { await c2.query(own.sql, own.vals); ok('legitimate INSERT accepted', t); }
-      catch (e) { bad('legitimate INSERT accepted', e.message.slice(0, 60)); }
-    });
-    await c.end(); await c2.end();
+    await c.end();
   }
 
   head('STEP 9 — UPDATE isolation');
@@ -252,15 +296,21 @@ async function synthesise(admin, table, orgId) {
     const c = await asTenant();
     const { table, bId } = usable.find((u) => u.bId) || usable[0];
     await withOrg(c, A.id, async () => {
-      const r = await c.query(`UPDATE public.${table} SET organization_id=organization_id WHERE organization_id=$1`, [B.id]);
-      r.rowCount === 0 ? ok("cannot UPDATE another tenant's rows", `${table}, 0 rows`) : bad("cannot UPDATE another tenant's rows", `${r.rowCount} rows`);
-      try {
-        const m = await c.query(`UPDATE public.${table} SET organization_id=$1 WHERE organization_id=$2`, [B.id, A.id]);
-        m.rowCount === 0 ? ok('cannot move a row A → B', '0 rows') : bad('cannot move a row A → B', `${m.rowCount} rows moved`);
-      } catch (e) { ok('cannot move a row A → B', e.code === '42501' ? 'WITH CHECK violation' : e.code); }
+      const r = await attempt(c, `UPDATE public.${table} SET organization_id=organization_id WHERE organization_id=$1`, [B.id]);
+      (r.denied || r.rowCount === 0)
+        ? ok("cannot UPDATE another tenant's rows", `${table}, ${r.denied ? r.code : '0 rows'}`)
+        : bad("cannot UPDATE another tenant's rows", `${r.rowCount} rows`);
+
+      const m = await attempt(c, `UPDATE public.${table} SET organization_id=$1 WHERE organization_id=$2`, [B.id, A.id]);
+      (m.denied || m.rowCount === 0)
+        ? ok('cannot move a row A → B', m.denied ? `refused ${m.code}` : '0 rows')
+        : bad('cannot move a row A → B', `${m.rowCount} rows moved`);
+
       if (bId) {
-        const byId = await c.query(`UPDATE public.${table} SET organization_id=organization_id WHERE id=$1`, [bId]);
-        byId.rowCount === 0 ? ok("IDOR: UPDATE by tenant B's id affects nothing") : bad('IDOR: UPDATE by id', `${byId.rowCount} rows`);
+        const byId = await attempt(c, `UPDATE public.${table} SET organization_id=organization_id WHERE id=$1`, [bId]);
+        (byId.denied || byId.rowCount === 0)
+          ? ok("IDOR: UPDATE by tenant B's id affects nothing")
+          : bad('IDOR: UPDATE by id', `${byId.rowCount} rows`);
       }
     });
     await c.end();
@@ -272,11 +322,11 @@ async function synthesise(admin, table, orgId) {
     const crossDeleted = [], idorHits = [];
     await withOrg(c, A.id, async () => {
       for (const { table, bId } of usable) {
-        const r = await c.query(`DELETE FROM public.${table} WHERE organization_id=$1`, [B.id]);
-        if (r.rowCount > 0) crossDeleted.push(`${table}=${r.rowCount}`);
+        const r = await attempt(c, `DELETE FROM public.${table} WHERE organization_id=$1`, [B.id]);
+        if (!r.denied && r.rowCount > 0) crossDeleted.push(`${table}=${r.rowCount}`);
         if (bId) {
-          const d = await c.query(`DELETE FROM public.${table} WHERE id=$1`, [bId]);
-          if (d.rowCount > 0) idorHits.push(table);
+          const d = await attempt(c, `DELETE FROM public.${table} WHERE id=$1`, [bId]);
+          if (!d.denied && d.rowCount > 0) idorHits.push(table);
         }
       }
     });
@@ -329,7 +379,7 @@ async function synthesise(admin, table, orgId) {
       ? ok('no legacy business tenant in a fresh database')
       : bad('no legacy business tenant in a fresh database', rows[0].name);
     const { rows: all } = await admin.query(
-      `SELECT name FROM organizations WHERE slug NOT IN ('tenant-a-rls','tenant-b-rls')`);
+      `SELECT name FROM organizations WHERE slug NOT LIKE 'tenant-%-rls-%'`);
     all.length === 0
       ? ok('fresh database seeds no organizations at all')
       : note(`organizations present besides the test fixtures: ${all.map((r) => r.name).join(', ')}`);
