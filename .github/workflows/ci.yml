@@ -288,6 +288,14 @@ jobs:
             sleep 1
           done
           echo "::error title=RLS enforcement::server did not become healthy as app_tenant with TENANT_RLS_ENFORCE=on"
+          # Surface the cause as annotations. The log itself needs repository
+          # admin rights to download, and "did not become healthy" on its own
+          # says nothing about which privilege or context was missing.
+          grep -iE "permission denied|migration attempt|fatal|FATAL|role .* does not exist|denied for" /tmp/enforce.log \
+            | tail -6 | while IFS= read -r line; do
+                echo "::error title=RLS enforcement cause::${line}"
+              done || true
+          { echo "## Enforcement readiness — FAILED"; echo; echo '```'; tail -40 /tmp/enforce.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           tail -40 /tmp/enforce.log || true
           kill "$(cat /tmp/enforce.pid)" 2>/dev/null || true
           exit 1
