@@ -403,9 +403,16 @@ jobs:
           echo "APP_TENANT_PW=$PW" >> "$GITHUB_ENV"
           PSQL="psql postgresql://postgres:postgres@localhost:5432/mga_idor_test -tAX -v ON_ERROR_STOP=1"
           $PSQL -c "ALTER ROLE app_tenant WITH LOGIN PASSWORD '$PW'"
-          FLAGS=$($PSQL -c "SELECT rolsuper||' '||rolbypassrls||' '||rolcreatedb||' '||rolcreaterole||' '||rolreplication FROM pg_roles WHERE rolname='app_tenant'")
-          echo "app_tenant [super bypassrls createdb createrole replication] = $FLAGS"
-          [ "$FLAGS" = "f f f f f" ] || { echo "::error::app_tenant has privileges it must not have: $FLAGS"; exit 1; }
+          # Asked as a count of privileges held rather than by string-matching
+          # the flags: psql renders booleans as t/f on their own but as
+          # true/false through ||, so an equality check against "f f f f f"
+          # failed against a perfectly correct role. Counting is immune to how
+          # the value happens to be formatted.
+          HELD=$($PSQL -c "SELECT rolsuper::int + rolbypassrls::int + rolcreatedb::int + rolcreaterole::int + rolreplication::int FROM pg_roles WHERE rolname='app_tenant'")
+          DETAIL=$($PSQL -c "SELECT 'super='||rolsuper||' bypassrls='||rolbypassrls||' createdb='||rolcreatedb||' createrole='||rolcreaterole||' replication='||rolreplication FROM pg_roles WHERE rolname='app_tenant'")
+          echo "app_tenant: $DETAIL"
+          [ -n "$HELD" ] || { echo "::error::app_tenant role not found"; exit 1; }
+          [ "$HELD" -eq 0 ] || { echo "::error::app_tenant holds $HELD privilege(s) it must not have — $DETAIL"; exit 1; }
 
       # The suite refuses to report IDOR results unless each session can first
       # reach its OWN tenant, so a broken login fails the job rather than
