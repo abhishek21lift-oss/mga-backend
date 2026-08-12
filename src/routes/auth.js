@@ -77,19 +77,27 @@ router.post('/login', validate(authSchemas.login), async (req, res) => {
     // ── Fetch user from DB ─────────────────────────────
     let rows;
     try {
+      // Via auth_user_by_email rather than a direct SELECT, because this query
+      // runs before any tenant context exists — that is what authentication
+      // is for — and under RLS the users policy then hides every user who
+      // belongs to an organization, which is all of them. The function is a
+      // narrow SECURITY DEFINER exception: exact email match on a UNIQUE
+      // column, authentication columns only, EXECUTE granted solely to
+      // app_tenant. See migration 160 for why the alternatives were rejected.
+      //
+      // Founder status still rides along on the session rather than being
+      // fetched separately. The badge appears beside the studio name in the
+      // sidebar, on the dashboard, on every profile and team screen — six
+      // places that would otherwise each need their own request for two
+      // columns that change roughly once, ever.
       const result = await pool.query(
-        `SELECT u.id, u.name, u.email, u.role, u.password, u.token_version,
-                u.trainer_id, u.member_id, u.is_active,
-                u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
-                -- Founder status rides along on the session rather than being
-                -- fetched separately. The badge appears beside the studio name
-                -- in the sidebar, on the dashboard, on every profile and team
-                -- screen — six places that would otherwise each need their own
-                -- request for two columns that change roughly once, ever.
-                o.is_founder, o.founder_number
-           FROM users u
-           LEFT JOIN organizations o ON o.id = u.organization_id
-          WHERE LOWER(u.email) = LOWER($1) AND u.is_active = true`,
+        `SELECT id, name, email, role, password, token_version,
+                trainer_id, member_id, is_active,
+                organization_id,
+                organization_name,
+                organization_logo_url,
+                is_founder, founder_number
+           FROM auth_user_by_email($1)`,
         [email]
       );
       rows = result.rows;

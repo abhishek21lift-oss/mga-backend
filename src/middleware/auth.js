@@ -105,16 +105,18 @@ async function auth(req, res, next) {
           // has to load here with role and organization_id: taking a client id
           // from the request instead is the exact mistake the isolation layer
           // exists to prevent.
-          `SELECT u.id, u.name, u.email, u.role, u.trainer_id, u.member_id, u.pt_client_id, u.branch_id,
-                  u.organization_id, o.name AS organization_name, o.logo_url AS organization_logo_url,
-                  o.is_founder, o.founder_number,
-                  o.status AS organization_status, o.subscription_status,
-                  o.trial_ends_at, o.current_period_end,
-                  u.is_active, u.token_version
-             FROM users u
-             LEFT JOIN organizations o ON o.id = u.organization_id
-            WHERE u.id = $1
-              AND (u.deleted_at IS NULL)`,
+          // Via auth_user_by_id, not a direct SELECT: this read happens on
+          // every request and is what resolveOrgId derives the organization
+          // from, so it necessarily runs before tenant context exists. Under
+          // RLS a direct read finds nothing and every authenticated request
+          // answers "Account not found or disabled". See migration 160.
+          `SELECT id, name, email, role, trainer_id, member_id, pt_client_id, branch_id,
+                  organization_id, organization_name, organization_logo_url,
+                  is_founder, founder_number,
+                  organization_status, subscription_status,
+                  trial_ends_at, current_period_end,
+                  is_active, token_version
+             FROM auth_user_by_id($1)`,
           [decoded.id]
         );
         rows = result.rows;

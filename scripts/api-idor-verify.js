@@ -141,6 +141,26 @@ const urlFor = (db, user, pw) => {
 
   const DENY = (s) => s === 403 || s === 404 || s === 400;
 
+  // A token that logs in but is rejected on every later request would make
+  // this entire suite pass for the wrong reason: 401 counts as "denied", so
+  // every IDOR assertion would be satisfied by a session that simply does not
+  // work. That happened — the middleware re-reads the user per request and
+  // RLS hid it — and every check reported PASS while testing nothing.
+  //
+  // So: prove the session can reach its OWN tenant's data first. If it
+  // cannot, the run is not evidence of isolation and stops here.
+  {
+    const own = await asA(request(app).get(`/api/clients/${clientA}`));
+    const reachesOwn = own.status === 200;
+    check({ method: 'GET', route: '/api/clients/:idOfA', scenario: 'A reads its OWN client (suite validity check)',
+      expected: '200', actual: String(own.status), pass: reachesOwn });
+    if (!reachesOwn) {
+      note('the session cannot reach its own tenant, so every "denied" below would be meaningless — stopping');
+      emit(`\n  ${failures} check(s) FAILED`);
+      process.exit(1);
+    }
+  }
+
   head('STEP 5 — resource IDOR (GET by another tenant id)');
   for (const [label, path] of [
     ['client', `/api/clients/${clientB}`],

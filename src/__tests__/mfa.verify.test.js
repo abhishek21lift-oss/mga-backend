@@ -47,7 +47,10 @@ describe('POST /api/profile/mfa/verify', () => {
 
   function mockProfilePool({ mfaSecret }) {
     pool.query.mockImplementation(async function() {
-      if (/FROM\s+users/i.test(arguments[0])) {
+      // The auth middleware's per-request user read became
+      // auth_user_by_id() in migration 160, so it can find a tenant user
+      // before tenant context exists. Match either spelling.
+      if (/FROM\s+users/i.test(arguments[0]) || /auth_user_by_id/i.test(arguments[0])) {
         return { rows: [adminUser] };
       }
       if (/INSERT INTO user_profiles/i.test(arguments[0])) {

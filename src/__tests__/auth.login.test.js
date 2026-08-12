@@ -23,7 +23,12 @@ jest.mock('../db/pool', () => {
       // real query gained its LEFT JOIN on organizations the mock silently
       // stopped matching, returned no rows, and login 401'd. Nobody saw it
       // because the suite could not even parse.
-      if (/from\s+users/i.test(sql) && /lower\(\s*u?\.?email\s*\)/i.test(sql)) {
+      // Matches either spelling of the same intent: the direct SELECT this
+      // used to be, or auth_user_by_email(), the SECURITY DEFINER function it
+      // became so that login can find a tenant user under RLS (migration 160).
+      // Pinned to intent rather than to SQL text, for the reason above.
+      if ((/from\s+users/i.test(sql) && /lower\(\s*u?\.?email\s*\)/i.test(sql))
+          || /auth_user_by_email/i.test(sql)) {
         const email = (params && params[0]) || '';
         const row = store.find(u => u.email.toLowerCase() === email.toLowerCase()) || null;
         return { rows: row ? [row] : [] };
