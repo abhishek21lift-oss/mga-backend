@@ -167,7 +167,7 @@ async function synthesise(admin, table, orgId) {
   head('STEP 3 — fail closed with no tenant context');
   {
     const c = await asTenant();
-    let leaked = [];
+    const leaked = [];
     for (const { table } of usable) {
       const { rows } = await c.query(`SELECT count(*)::int n FROM public.${table}`);
       if (rows[0].n !== 0) leaked.push(`${table}=${rows[0].n}`);
