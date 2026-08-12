@@ -39,8 +39,26 @@ let failures = 0;
 const transcript = [];
 const emit = (l) => { transcript.push(l); console.log(l); };
 const ok = (l, d = '') => emit(`  PASS  ${l}${d ? '  — ' + d : ''}`);
-const bad = (l, d = '') => { failures++; emit(`  FAIL  ${l}${d ? '  — ' + d : ''}`); };
+/**
+ * A failure is also emitted as a workflow ::error:: command.
+ *
+ * Actions job logs need repository admin rights to download, so on a public
+ * repo a red job says only "something failed". Annotations are exposed
+ * through the Checks API without a token, so the reason travels with the
+ * result — which matters most for exactly this job, where the difference
+ * between "the harness broke" and "tenant A read tenant B" is the whole
+ * point.
+ */
+const bad = (l, d = '') => {
+  failures++;
+  emit(`  FAIL  ${l}${d ? '  — ' + d : ''}`);
+  if (process.env.GITHUB_ACTIONS) console.log(`::error title=RLS::${l}${d ? ' — ' + d : ''}`);
+};
 const head = (t) => emit(`\n=== ${t} ===`);
+const note = (l) => {
+  emit(`  NOTE  ${l}`);
+  if (process.env.GITHUB_ACTIONS) console.log(`::notice title=RLS::${l}`);
+};
 
 process.on('exit', () => {
   const f = process.env.GITHUB_STEP_SUMMARY;
@@ -139,7 +157,7 @@ async function synthesise(admin, table, orgId) {
     SELECT tablename, qual FROM pg_policies
      WHERE schemaname='public' AND policyname='tenant_isolation' ORDER BY 1`);
   const strict = policied.filter((p) => !/IS NULL/i.test(p.qual || '')).map((p) => p.tablename);
-  emit(`  policies: ${policied.length} (strict ${strict.length}, shared ${policied.length - strict.length})`);
+  note(`policies ${policied.length} (strict ${strict.length}, shared ${policied.length - strict.length})`);
 
   // Seed one row per strict table for each tenant, as the owner.
   const usable = [];
@@ -153,7 +171,7 @@ async function synthesise(admin, table, orgId) {
       usable.push({ table: t, aId: ra.rows[0] && ra.rows[0].id, bId: rb.rows[0] && rb.rows[0].id });
     } catch { /* table needs more than we can synthesise — skip */ }
   }
-  emit(`  seeded fixtures in ${usable.length} tenant table(s)`);
+  note(`seeded fixtures in ${usable.length} of ${strict.length} strict tenant tables`);
   if (usable.length === 0) { bad('at least one tenant table seeded'); process.exit(1); }
 
   const asTenant = () => connect(urlFor(DB, 'app_tenant', APP_PW));
@@ -314,7 +332,7 @@ async function synthesise(admin, table, orgId) {
       `SELECT name FROM organizations WHERE slug NOT IN ('tenant-a-rls','tenant-b-rls')`);
     all.length === 0
       ? ok('fresh database seeds no organizations at all')
-      : emit(`  NOTE  organizations present besides the test fixtures: ${all.map((r) => r.name).join(', ')}`);
+      : note(`organizations present besides the test fixtures: ${all.map((r) => r.name).join(', ')}`);
   }
 
   head('STEP 16 — index coverage for the policy predicate');
