@@ -43,9 +43,38 @@ const DB_B = 'mga_bootstrap_b';
 const DB_EXISTING = 'mga_bootstrap_existing';
 
 let failures = 0;
-const ok = (label, detail = '') => console.log(`  PASS  ${label}${detail ? '  — ' + detail : ''}`);
-const bad = (label, detail = '') => { failures++; console.log(`  FAIL  ${label}${detail ? '  — ' + detail : ''}`); };
-const head = (t) => console.log(`\n=== ${t} ===`);
+
+/**
+ * Everything printed is also written to the GitHub Actions job summary.
+ *
+ * Not decoration: downloading an Actions job log requires admin rights on the
+ * repository, so on a public repo the run's pass/fail is visible to everyone
+ * and the reason for it is visible to nobody. The step summary is exposed
+ * through the Checks API, so the actual counts — how many migrations applied,
+ * whether the two builds hashed identically — can be read without a token.
+ */
+const transcript = [];
+const emit = (line) => { transcript.push(line); console.log(line); };
+const ok = (label, detail = '') => emit(`  PASS  ${label}${detail ? '  — ' + detail : ''}`);
+const bad = (label, detail = '') => { failures++; emit(`  FAIL  ${label}${detail ? '  — ' + detail : ''}`); };
+const head = (t) => emit(`\n=== ${t} ===`);
+
+function writeSummary() {
+  const file = process.env.GITHUB_STEP_SUMMARY;
+  if (!file) return;
+  const body = [
+    '## Fresh-database bootstrap',
+    '',
+    failures ? `**${failures} check(s) FAILED**` : '**All checks passed**',
+    '',
+    '```',
+    transcript.join('\n').trim(),
+    '```',
+    '',
+  ].join('\n');
+  try { fs.appendFileSync(file, body); } catch { /* summary is best-effort */ }
+}
+process.on('exit', writeSummary);
 
 /** Same URL, different database name. */
 function urlFor(db) {
@@ -126,7 +155,7 @@ async function fingerprint(c) {
   head('STEP 1 — environment');
   await withAdmin(async (c) => {
     const { rows: [v] } = await c.query('SELECT version() v');
-    console.log('  ' + v.v.split(',')[0]);
+    emit('  ' + v.v.split(',')[0]);
     const major = Number((await c.query('SHOW server_version_num')).rows[0].server_version_num) / 10000 | 0;
     major >= 17 ? ok('PostgreSQL >= 17', 'major ' + major) : bad('PostgreSQL >= 17', 'major ' + major);
     const { rows: av } = await c.query(`SELECT default_version FROM pg_available_extensions WHERE name='vector'`);
@@ -182,7 +211,7 @@ async function fingerprint(c) {
   }
 
   head('STEP 6 — object inventory');
-  for (const [k, n] of Object.entries(a.fp.counts)) console.log(`  ${k.padEnd(12)} ${n}`);
+  for (const [k, n] of Object.entries(a.fp.counts)) emit(`  ${k.padEnd(12)} ${n}`);
 
   head('STEP 7 — pgvector functional test');
   {
@@ -200,7 +229,7 @@ async function fingerprint(c) {
     const { rows: vidx } = await c.query(
       `SELECT indexname, indexdef FROM pg_indexes
         WHERE schemaname='public' AND (indexdef ILIKE '%USING ivfflat%' OR indexdef ILIKE '%USING hnsw%')`);
-    console.log(`  vector indexes: ${vidx.length ? vidx.map((r) => r.indexname).join(', ') : '(none declared)'}`);
+    emit(`  vector indexes: ${vidx.length ? vidx.map((r) => r.indexname).join(', ') : '(none declared)'}`);
 
     // Round-trip through a real vector column: write, read, and order by
     // distance. Uses whichever table actually has one rather than assuming
@@ -308,7 +337,7 @@ async function fingerprint(c) {
         (SELECT count(*)::int FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
           WHERE n.nspname='public' AND c.relkind='r' AND c.relrowsecurity) AS rls_enabled,
         (SELECT count(*)::int FROM pg_policies WHERE schemaname='public') AS policies`);
-    console.log(`  tables ${s.tables} | organization_id ${s.org_scoped} | branch_id ${s.branch_scoped} | RLS-enabled ${s.rls_enabled} | policies ${s.policies}`);
+    emit(`  tables ${s.tables} | organization_id ${s.org_scoped} | branch_id ${s.branch_scoped} | RLS-enabled ${s.rls_enabled} | policies ${s.policies}`);
     const { rows: unscoped } = await c.query(`
       SELECT t.table_name FROM information_schema.tables t
        WHERE t.table_schema='public' AND t.table_type='BASE TABLE'
@@ -317,7 +346,7 @@ async function fingerprint(c) {
                           WHERE c.table_schema='public' AND c.table_name=t.table_name
                             AND c.column_name IN ('organization_id'))
        ORDER BY 1`);
-    console.log(`  without organization_id (${unscoped.length}): ${unscoped.map((r) => r.table_name).join(' ')}`);
+    emit(`  without organization_id (${unscoped.length}): ${unscoped.map((r) => r.table_name).join(' ')}`);
     await c.end();
   }
 
