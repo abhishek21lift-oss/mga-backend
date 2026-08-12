@@ -26,9 +26,16 @@ const { tenantScope } = require('../lib/tenant-db');
 const logger = require('../lib/logger');
 const { logActivity } = require('../lib/activityLog');
 
-// Both ledgers, aliased to one shape. pt_payments has no branch_id — shimmed
-// NULL so the branch-scope clause (branch_id = $n OR branch_id IS NULL) keeps
-// treating those rows as visible.
+// Both ledgers, aliased to one shape. NEITHER table has a branch_id — both
+// are shimmed NULL so the branch-scope clause
+// (branch_id = $n OR branch_id IS NULL) keeps treating those rows as visible.
+//
+// The legacy half used to select lp.branch_id, and that column does not exist
+// on `payments`: every GET /api/payments answered 500 with
+// `42703 column lp.branch_id does not exist`. It failed identically as the
+// owner role, so it was never an RLS or privilege problem — just a query
+// nothing exercised. The route had no test, and the first thing to call it
+// was the tenant-isolation suite.
 const LEDGER_SQL = `
   SELECT p.id, p.client_id, c.name AS client_name, p.trainer_id,
          t.name AS trainer_name, p.amount, p.incentive_amt,
@@ -43,7 +50,7 @@ const LEDGER_SQL = `
          lp.trainer_name, lp.amount, lp.incentive_amt,
          UPPER(lp.method) AS method, lp.receipt_no,
          lp.date, lp.notes, lp.deleted_at, lp.created_at,
-         lp.branch_id::text, lp.package_type, NULL::uuid AS organization_id
+         NULL::text AS branch_id, lp.package_type, NULL::uuid AS organization_id
   FROM payments lp
 `;
 
