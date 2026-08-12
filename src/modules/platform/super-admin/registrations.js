@@ -81,35 +81,52 @@ async function create(req, res, next) {
     const { error, value } = validate(req.body || {});
     if (error) return res.status(400).json({ error: { code: 'INVALID', message: error } });
 
-    const { rows: dupe } = await pool.query(
-      `SELECT id, status FROM studio_registrations
-        WHERE lower(email) = $1 AND status = 'pending' LIMIT 1`,
-      [value.email]
-    );
-    const { rows: existingUser } = await pool.query(
-      'SELECT id FROM users WHERE lower(email) = $1 LIMIT 1',
-      [value.email]
-    );
+    // Same cost factor the users table uses, because this hash becomes that
+    // row's password verbatim on approval. Hashed here rather than in SQL so
+    // the plaintext never reaches the query text or the database log.
+    const password_hash = await bcrypt.hash(value.password, 12);
 
-    if (dupe.length || existingUser.length) {
+    // One call, not three. This row is pre-tenant — organization_id stays NULL
+    // until a super admin approves it — and 157 scopes studio_registrations
+    // strictly to app.org_id, which an anonymous request never sets. So
+    // app_tenant can neither insert the row nor run the two duplicate lookups
+    // that used to sit here: both silently returned zero rows under RLS, which
+    // failed OPEN and defeated the anti-enumeration response below.
+    //
+    // 162_public_registration_function.sql crosses that boundary once, for
+    // this one insert, with organization_id and status written as literals so
+    // neither can be supplied by the caller. See it for why an INSERT policy
+    // cannot work here (INSERT ... RETURNING needs a SELECT policy, and any
+    // SELECT policy wide enough would expose every applicant's password_hash).
+    const { rows } = await pool.query(
+      `SELECT registration_id, registration_status, created_at, was_duplicate
+         FROM platform_submit_studio_registration($1,$2,$3,$4,$5)`,
+      [value.full_name, value.business_name, value.mobile, value.email, password_hash]
+    );
+    const result = rows[0];
+
+    if (result.was_duplicate) {
       logger.info({ email: value.email }, 'registration_duplicate_suppressed');
       return res.status(202).json({ data: { status: 'pending' } });
     }
 
-    // Same cost factor the users table uses, because this hash becomes that
-    // row's password verbatim on approval.
-    const password_hash = await bcrypt.hash(value.password, 12);
-
-    const { rows } = await pool.query(
-      `INSERT INTO studio_registrations
-         (full_name, business_name, mobile, email, password_hash)
-       VALUES ($1,$2,$3,$4,$5)
-       RETURNING ${PUBLIC_COLUMNS}`,
-      [value.full_name, value.business_name, value.mobile, value.email, password_hash]
-    );
-
-    logger.info({ id: rows[0].id, email: value.email }, 'registration_received');
-    res.status(201).json({ data: rows[0] });
+    logger.info({ id: result.registration_id, email: value.email }, 'registration_received');
+    res.status(201).json({
+      data: {
+        id: result.registration_id,
+        full_name: value.full_name,
+        business_name: value.business_name,
+        mobile: value.mobile,
+        email: value.email,
+        status: result.registration_status,
+        organization_id: null,
+        reviewed_at: null,
+        reviewed_by: null,
+        review_note: null,
+        created_at: result.created_at,
+        updated_at: result.created_at,
+      },
+    });
   } catch (err) {
     // A race on the partial unique index means a second application landed
     // first. That is still "pending" from the applicant's point of view.
