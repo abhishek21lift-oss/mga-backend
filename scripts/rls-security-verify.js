@@ -149,23 +149,87 @@ async function foreignKeys(admin, table, cache) {
  * enum-style checks (`col = ANY (ARRAY['a','b'])`, `col IN ('a','b')`) are
  * the shape that accounts for nearly all of them.
  */
-async function checkAllowedValues(admin, table, cache) {
+async function checkConstraintHints(admin, table, cache) {
   if (cache.has(table)) return cache.get(table);
   const { rows } = await admin.query(`
     SELECT pg_get_constraintdef(con.oid) AS def
       FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid
      WHERE con.contype='c' AND c.relname=$1 AND c.relnamespace='public'::regnamespace`, [table]);
-  const map = new Map();
+
+  const enums = new Map();   // column → a value the constraint permits
+  const minima = new Map();  // column → smallest number that satisfies it
+  const unsupported = new Map(); // column → why no value can be chosen
+  const truncated = new Map();   // column → date_trunc unit it must align to
+
   for (const { def } of rows) {
-    // CHECK (((status)::text = ANY ((ARRAY['a'::character varying, …])::text[])))
-    const m = def.match(/\(?\(?([a-zA-Z_][a-zA-Z0-9_]*)\)?::?\w*\s*(?:=\s*ANY|IN)\s*\(?\(?ARRAY?\s*\[([^\]]+)\]/i)
-           || def.match(/\(?\(?([a-zA-Z_][a-zA-Z0-9_]*)\)?::?\w*\s*IN\s*\(([^)]+)\)/i);
-    if (!m) continue;
-    const first = (m[2].match(/'([^']+)'/) || [])[1];
-    if (first && !map.has(m[1])) map.set(m[1], first);
+    // Enum-style. Both spellings occur:
+    //   (status = ANY (ARRAY['CREATED'::text, …]))
+    //   ((status)::text = ANY ((ARRAY['a'::character varying, …])::text[]))
+    // An earlier version required a `::` cast after the column name, so it
+    // silently matched only the second and every plain enum check fell
+    // through to a generic string and a 23514.
+    const e = def.match(/\(?\(?([a-zA-Z_][a-zA-Z0-9_]*)\)?(?:::[\w ]+)?\s*(?:=\s*ANY\s*\(+\s*ARRAY|IN)\s*[[(]([^\])]+)/i);
+    if (e) {
+      const first = (e[2].match(/'([^']*)'/) || [])[1];
+      if (first !== undefined && !enums.has(e[1])) enums.set(e[1], first);
+    }
+
+    // Numeric floors: `col > 0`, `col >= 1`, `(col >= 1) AND (col <= 20)`.
+    for (const m of def.matchAll(/\(?([a-zA-Z_][a-zA-Z0-9_]*)\)?(?:::[\w ]+)?\s*(>=?)\s*\(?(-?\d+(?:\.\d+)?)\)?/g)) {
+      const [, col, op, num] = m;
+      const floor = op === '>' ? Number(num) + 1 : Number(num);
+      minima.set(col, Math.max(minima.get(col) ?? Number.NEGATIVE_INFINITY, floor));
+    }
+
+    // Shapes no generic value can satisfy — recorded so the skip reason names
+    // the real obstacle instead of a bare SQLSTATE.
+    const rx = def.match(/\(?([a-zA-Z_][a-zA-Z0-9_]*)\)?(?:::[\w ]+)?\s*~\s*'/);
+    if (rx) unsupported.set(rx[1], 'value must match a regex CHECK');
+    // `period = date_trunc('month', period)::date` — satisfiable with the
+    // first day of a month, so it is a value to choose rather than a reason
+    // to skip the table.
+    const dt = def.match(/\(?([a-zA-Z_][a-zA-Z0-9_]*)\)?\s*=\s*\(?date_trunc\('(\w+)'/i);
+    if (dt) truncated.set(dt[1], dt[2]);
+    if (/\bOR\b/.test(def) && /\bAND\b/.test(def) && !e) {
+      const c1 = def.match(/\(\(?([a-zA-Z_][a-zA-Z0-9_]*)\)?\s*=\s*'/);
+      if (c1 && !enums.has(c1[1])) unsupported.set(c1[1], 'multi-column conditional CHECK');
+    }
   }
-  cache.set(table, map);
-  return map;
+  const hints = { enums, minima, unsupported, truncated };
+  cache.set(table, hints);
+  return hints;
+}
+
+/** A value for a required column that its table's CHECK constraints accept. */
+function valueFor(col, udt, hints, run, nudge) {
+  if (hints.unsupported.has(col)) return { unsupported: hints.unsupported.get(col) };
+  if (hints.enums.has(col)) return { value: hints.enums.get(col) };
+  if (hints.truncated.has(col)) {
+    const d = new Date();
+    const unit = hints.truncated.get(col);
+    const aligned = unit === 'year' ? new Date(Date.UTC(d.getUTCFullYear(), 0, 1))
+                                    : new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
+    return { value: aligned.toISOString().slice(0, 10) };
+  }
+  if (/^(int2|int4|int8|numeric|float4|float8)$/.test(udt)) {
+    // 1 rather than 0: `> 0` and `>= 1` are by far the commonest floors here,
+    // and 1 also satisfies every upper bound in this schema (<= 20, <= 100,
+    // <= 120, <= 1440).
+    const floor = hints.minima.get(col);
+    const base = Number.isFinite(floor) ? Math.max(floor, 1) : 1;
+    // Offset per tenant: an identical value collides on any UNIQUE column the
+    // second tenant's fixture touches, which is not a policy failure but does
+    // cost a table's coverage.
+    return { value: base + (nudge || 0) };
+  }
+  if (udt === 'bool') return { value: false };
+  if (/^(timestamptz|timestamp|date|time)$/.test(udt)) return { value: new Date().toISOString() };
+  if (udt === 'jsonb' || udt === 'json') return { value: '{}' };
+  if (udt === 'uuid') return { value: crypto.randomUUID() };
+  if (/^(text|varchar|bpchar|citext|name)$/.test(udt)) {
+    return { value: `rls-${run}-${Math.random().toString(36).slice(2, 8)}` };
+  }
+  return { unsupported: `unsupported type ${udt}` };
 }
 
 /** Columns that must be supplied: NOT NULL, no default. */
@@ -192,41 +256,39 @@ async function makeFixture(admin, table, orgId, ctx, seen = []) {
 
   const cols = await requiredColumns(admin, table, ctx.colCache);
   const fks = await foreignKeys(admin, table, ctx.fkCache);
-  const allowed = await checkAllowedValues(admin, table, ctx.chkCache);
+  const hints = await checkConstraintHints(admin, table, ctx.chkCache);
   const fkByCol = new Map(fks.map((f) => [f.column_name, f]));
 
   const names = [], vals = [];
   for (const c of cols) {
     if (c.column_name === 'organization_id') { names.push(c.column_name); vals.push(orgId); continue; }
     if (c.is_nullable === 'YES' || c.column_default !== null) continue;
-    if (allowed.has(c.column_name)) { names.push(c.column_name); vals.push(allowed.get(c.column_name)); continue; }
 
     const fk = fkByCol.get(c.column_name);
     if (fk) {
       // Reuse a parent already made for this tenant before making another.
-      const key = `${fk.parent_table}:${orgId}`;
-      let parentId = ctx.made.get(key);
-      if (parentId === undefined) {
+      // Key on the referenced column too: a parent may be referenced by
+      // different columns in different children, and not every table has an
+      // `id`. Composite and natural keys are read off the created row via
+      // fk.parent_column rather than assumed.
+      const key = `${fk.parent_table}.${fk.parent_column}:${orgId}`;
+      let parentVal = ctx.made.get(key);
+      if (parentVal === undefined) {
         const r = await makeFixture(admin, fk.parent_table, orgId, ctx, [...seen, table]);
         if (r.skipped) return { skipped: `needs ${fk.parent_table}: ${r.skipped}` };
-        parentId = r.id;
-        ctx.made.set(key, parentId);
+        parentVal = r.row ? r.row[fk.parent_column] : undefined;
+        if (parentVal === undefined || parentVal === null) {
+          return { skipped: `parent ${fk.parent_table} has no value for ${fk.parent_column}` };
+        }
+        ctx.made.set(key, parentVal);
       }
-      if (parentId === null || parentId === undefined) return { skipped: `parent ${fk.parent_table} produced no id` };
-      names.push(c.column_name); vals.push(parentId);
+      names.push(c.column_name); vals.push(parentVal);
       continue;
     }
 
-    const t = c.udt_name;
-    let v;
-    if (/^(int2|int4|int8|numeric|float4|float8)$/.test(t)) v = 0;
-    else if (t === 'bool') v = false;
-    else if (/^(timestamptz|timestamp|date|time)$/.test(t)) v = new Date().toISOString();
-    else if (t === 'jsonb' || t === 'json') v = '{}';
-    else if (t === 'uuid') v = crypto.randomUUID();       // not an FK: a free id
-    else if (/^(text|varchar|bpchar|citext|name)$/.test(t)) v = `rls-${ctx.run}-${Math.random().toString(36).slice(2, 8)}`;
-    else return { skipped: `unsupported required column ${c.column_name} (${t})` };
-    names.push(c.column_name); vals.push(v);
+    const chosen = valueFor(c.column_name, c.udt_name, hints, ctx.run, ctx.nudge.get(orgId) || 0);
+    if (chosen.unsupported) return { skipped: `${c.column_name}: ${chosen.unsupported}` };
+    names.push(c.column_name); vals.push(chosen.value);
   }
 
   // Only the table under test must be tenant-scoped. A parent created on the
@@ -250,30 +312,22 @@ async function makeFixture(admin, table, orgId, ctx, seen = []) {
 async function insertStatementFor(admin, table, orgId, ctx) {
   const cols = await requiredColumns(admin, table, ctx.colCache);
   const fks = await foreignKeys(admin, table, ctx.fkCache);
-  const allowed = await checkAllowedValues(admin, table, ctx.chkCache);
+  const hints = await checkConstraintHints(admin, table, ctx.chkCache);
   const fkByCol = new Map(fks.map((f) => [f.column_name, f]));
   const names = [], vals = [];
   for (const c of cols) {
     if (c.column_name === 'organization_id') { names.push(c.column_name); vals.push(orgId); continue; }
     if (c.is_nullable === 'YES' || c.column_default !== null) continue;
-    if (allowed.has(c.column_name)) { names.push(c.column_name); vals.push(allowed.get(c.column_name)); continue; }
     const fk = fkByCol.get(c.column_name);
     if (fk) {
-      const parentId = ctx.made.get(`${fk.parent_table}:${orgId}`);
-      if (parentId === undefined) return null;
-      names.push(c.column_name); vals.push(parentId);
+      const parentVal = ctx.made.get(`${fk.parent_table}.${fk.parent_column}:${orgId}`);
+      if (parentVal === undefined) return null;
+      names.push(c.column_name); vals.push(parentVal);
       continue;
     }
-    const t = c.udt_name;
-    let v;
-    if (/^(int2|int4|int8|numeric|float4|float8)$/.test(t)) v = 0;
-    else if (t === 'bool') v = false;
-    else if (/^(timestamptz|timestamp|date|time)$/.test(t)) v = new Date().toISOString();
-    else if (t === 'jsonb' || t === 'json') v = '{}';
-    else if (t === 'uuid') v = crypto.randomUUID();
-    else if (/^(text|varchar|bpchar|citext|name)$/.test(t)) v = `rls-${ctx.run}-${Math.random().toString(36).slice(2, 8)}`;
-    else return null;
-    names.push(c.column_name); vals.push(v);
+    const chosen = valueFor(c.column_name, c.udt_name, hints, ctx.run, ctx.nudge.get(orgId) || 0);
+    if (chosen.unsupported) return null;
+    names.push(c.column_name); vals.push(chosen.value);
   }
   if (!names.includes('organization_id')) return null;
   const ph = names.map((_, i) => `$${i + 1}`).join(',');
@@ -348,9 +402,11 @@ async function insertStatementFor(admin, table, orgId, ctx) {
 
   // Seed one row per strict table for each tenant, as the owner, creating
   // whatever parents each table requires.
-  const ctx = { colCache: new Map(), fkCache: new Map(), chkCache: new Map(), made: new Map(), run: RUN };
-  ctx.made.set(`organizations:${A.id}`, A.id);
-  ctx.made.set(`organizations:${B.id}`, B.id);
+  const ctx = { colCache: new Map(), fkCache: new Map(), chkCache: new Map(), made: new Map(), nudge: new Map(), run: RUN };
+  ctx.made.set(`organizations.id:${A.id}`, A.id);
+  ctx.made.set(`organizations.id:${B.id}`, B.id);
+  ctx.nudge.set(A.id, 0);
+  ctx.nudge.set(B.id, 1);
 
   const usable = [], skipped = [];
   for (const t of strict) {
