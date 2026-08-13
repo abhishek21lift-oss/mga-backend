@@ -90,8 +90,25 @@ router.post('/', async (req, res) => {
     res.json({ received: true });
   } catch (err) {
     logger.error({ err: err.message, eventType }, 'Razorpay webhook handler error');
-    // Return 200 anyway so Razorpay does not retry — DB errors are logged
-    res.json({ received: true });
+    // 500, not 200.
+    //
+    // This used to acknowledge the event regardless, on the reasoning that a
+    // database error is ours and a retry would not help. The effect was that
+    // the handler told Razorpay "processed" for events it had not processed,
+    // and the provider — correctly trusting that — never sent them again. A
+    // failed write became permanent silent data loss with a log line as its
+    // only trace.
+    //
+    // That is not theoretical here. `payments` carries none of the columns
+    // this file writes (gateway_payment_id, gateway_status, gateway_payload,
+    // refund_id), so today every capture, failure and refund raises 42703 and
+    // is dropped. The 200 is what let that survive unnoticed.
+    //
+    // A 5xx makes Razorpay retry, which is right for a transient fault and
+    // makes a permanent one loud instead of invisible. Signature and payload
+    // rejections keep their 4xx and are still never retried — those are the
+    // caller's fault, not ours.
+    res.status(500).json({ received: false });
   }
 });
 

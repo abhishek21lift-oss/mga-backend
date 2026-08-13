@@ -190,3 +190,29 @@ describe('Razorpay webhook — unknown and repeated events', () => {
     expect(first).not.toMatch(/\+\s*\$|\+\s*\d|COALESCE\([^)]*\)\s*\+/);
   });
 });
+
+describe('Razorpay webhook — a failed write is never reported as success', () => {
+  it('answers 5xx when the database rejects the write, so the provider retries', async () => {
+    const { app, pool } = makeApp();
+    // Exactly today's production failure: `payments` has no gateway_payment_id.
+    pool.query.mockRejectedValueOnce(
+      Object.assign(new Error('column "gateway_payment_id" does not exist'), { code: '42703' }),
+    );
+    const body = paymentEvent('payment.captured', 'pay_db_error');
+    const res = await post(app, body, sign(body));
+
+    // A 200 here tells Razorpay the event is handled and it is never resent.
+    // The write did not happen, so that is silent, permanent data loss.
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    expect(res.body).toEqual({ received: false });
+  });
+
+  it('still refuses a bad signature with 4xx, which must never be retried', async () => {
+    const { app } = makeApp();
+    const body = paymentEvent('payment.captured', 'pay_sig');
+    const res = await post(app, body, sign(body, 'wrong'));
+    // The caller is at fault, not us: retrying cannot help and a 5xx would ask
+    // Razorpay to hammer an endpoint that will keep refusing.
+    expect(res.status).toBe(400);
+  });
+});
