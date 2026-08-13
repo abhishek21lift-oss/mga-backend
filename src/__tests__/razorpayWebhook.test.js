@@ -253,21 +253,27 @@ describe('event dispatch', () => {
 });
 
 describe('failure handling', () => {
-  test('a database error is answered 200 and only logged — the swallow', async () => {
-    // Pinning current behaviour, not endorsing it. The route answers 200 on a
-    // failed write so Razorpay does not retry, which means a write that fails
-    // for ANY reason — including the missing-column problem described at the
-    // top of this file — is indistinguishable to the sender from success.
-    // If the handler is ever pointed at a real table, this is the line that
-    // decides whether a transient outage loses the event permanently.
+  test('a database error is answered 5xx, so the event is not lost', async () => {
+    // This test used to assert the opposite, and said so: it pinned the 200 as
+    // "current behaviour, not endorsing it", and predicted that a write failing
+    // for any reason would be indistinguishable to the sender from success.
+    //
+    // That prediction was already true in production. `payments` has none of
+    // the columns the route writes, so every event raised 42703 and was
+    // acknowledged anyway — Razorpay was told "processed", correctly never
+    // resent it, and the write was lost with one log line as its only trace.
+    //
+    // The expectation changed because the behaviour was wrong, not because the
+    // test was inconvenient. A 5xx asks the provider to retry: right for a
+    // transient fault, and loud rather than invisible for a permanent one.
     const pool = require('../db/pool');
     pool.query.mockRejectedValueOnce(new Error('column "gateway_status" does not exist'));
 
     const body = captured('pay_DBERR');
     const res = await post(appWithSecret(SECRET), body, sign(body));
 
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ received: true });
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    expect(res.body).toEqual({ received: false });
     expect(mockLog.error).toHaveBeenCalled();
   });
 });
