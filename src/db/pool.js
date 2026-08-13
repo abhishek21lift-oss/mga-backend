@@ -321,6 +321,15 @@ pool.scopeClient = scopeClient;
 // Test connection on startup. Don't crash here — Render's healthcheck will
 // surface a 5xx and you can read the log. Crashing prevents redeploys from
 // recovering when Supabase has a brief connectivity blip.
+//
+// Skipped under test. This is a deploy-time readiness probe, and it has no
+// value in a Jest worker: it opens a connection on import, which frequently
+// outlives the suite that triggered it. Jest then tears the module registry
+// down and pg's lazy `require('net')` inside the TLS branch returns undefined,
+// surfacing as "Cannot read properties of undefined (reading 'isIP')" against
+// an unrelated test. jest.setup.env.js already prevents the URL from pointing
+// anywhere real; this stops the connection being attempted at all.
+if (process.env.NODE_ENV !== 'test') {
 pool.connect()
   .then(client => {
     logger.info('Connected to Supabase PostgreSQL');
@@ -332,5 +341,6 @@ pool.connect()
     logger.error('  2. Check the Supabase project is not paused');
     logger.error('  3. Check the password in the URI matches your DB password');
   });
+}
 
 module.exports = pool;
