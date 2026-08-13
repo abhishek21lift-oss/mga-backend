@@ -39,6 +39,14 @@ for (const key of ['DATABASE_URL', 'MIGRATION_DATABASE_URL', 'PLATFORM_DATABASE_
   if (!process.env[key]) process.env[key] = UNREACHABLE;
 }
 
+// Real secrets, pinned to obvious test values. .env carries JWT_SECRET, and a
+// worker holding the production token-signing key is a worse outcome than a
+// stray database connection: anything that leaks it can mint valid sessions
+// for every tenant. FRONTEND_URL is not secret but is pinned so redirect
+// assertions do not depend on whose machine runs them.
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-only-jwt-secret-not-a-real-key-0000';
+process.env.FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+
 // Keep a suite from reaching a real broker for the same reason.
 process.env.REDIS_URL = process.env.REDIS_URL || '';
 process.env.RUN_WORKERS = process.env.RUN_WORKERS || '0';

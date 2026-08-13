@@ -1,5 +1,14 @@
 // src/db/pool.js
-require('dotenv').config();
+// Not under test. dotenv reads the repository .env, which on a developer
+// machine holds production credentials — and this module is required by 129
+// files, so a single unmocked suite anywhere pulls them into the worker.
+// Measured before this guard: DATABASE_URL went from unset to the production
+// Supabase host, and the readiness probe below opened a live connection to it.
+//
+// jest.setup.env.js pins deterministic values first and dotenv would not
+// override them, but that is a list that has to be maintained. This is the
+// root cause: in a test process there is no .env to load at all.
+if (process.env.NODE_ENV !== 'test') require('dotenv').config();
 const fs = require('fs');
 const { Pool } = require('pg');
 const logger = require('../lib/logger');
