@@ -12,7 +12,19 @@
 // notifies. Run standalone (`node src/workers/subscription.worker.js`) or let the
 // in-process scheduler in server.js call runSubscriptionSweep().
 
-const pool = require('../db/pool');
+// Tier three (migration 163). This worker is a PLATFORM job end to end: it
+// sweeps trials, freezes and expiries across every studio's subscription TO
+// the platform, and the four tables it touches — organizations,
+// subscription_events, notifications, users — are exactly what 163 grants
+// app_platform.
+//
+// It ran on the tenant pool, with no tenant context and none possible: a
+// platform sweep has no single organization to scope to. Under app_tenant
+// that meant organizations returned nothing, notifications was refused
+// outright by the deny-all, and the whole sweep completed successfully
+// having done nothing at all. Measured: 0 organizations visible as
+// app_tenant, 41 as app_platform.
+const platformPool = require('../db/platformPool');
 const logger = require('../lib/logger');
 const subscription = require('../lib/subscription');
 
@@ -20,13 +32,13 @@ const REMINDER_DAYS = [7, 3, 1, 0]; // 0 = expiry day
 
 // In-app notification to every active admin of a studio.
 async function notifyStudioAdmins(orgId, title, body, link) {
-  const { rows } = await pool.query(
+  const { rows } = await platformPool.query(
     `SELECT id FROM users WHERE organization_id = $1 AND role = 'admin' AND is_active = true AND deleted_at IS NULL`,
     [orgId]
   );
   for (const u of rows) {
     try {
-      await pool.query(
+      await platformPool.query(
         `INSERT INTO notifications (user_id, type, title, body, link) VALUES ($1,'subscription',$2,$3,$4)`,
         [u.id, title, body, link || '/subscription']
       );
@@ -36,7 +48,7 @@ async function notifyStudioAdmins(orgId, title, body, link) {
 
 async function logEvent(orgId, event, data) {
   try {
-    await pool.query(
+    await platformPool.query(
       `INSERT INTO subscription_events (organization_id, event, data) VALUES ($1,$2,$3)`,
       [orgId, event, data ? JSON.stringify(data) : null]
     );
@@ -45,7 +57,7 @@ async function logEvent(orgId, event, data) {
 
 // True if a reminder for this (org, kind, days) was already logged in the last ~20h.
 async function reminderAlreadySent(orgId, kind, days) {
-  const { rows } = await pool.query(
+  const { rows } = await platformPool.query(
     `SELECT 1 FROM subscription_events
       WHERE organization_id = $1 AND event = 'reminder_sent'
         AND data->>'kind' = $2 AND (data->>'days')::int = $3
@@ -57,7 +69,7 @@ async function reminderAlreadySent(orgId, kind, days) {
 
 // ── 1 & 2: freeze lapsed trials / expire lapsed subscriptions ─────────────────
 async function sweepExpiries() {
-  const { rows: frozen } = await pool.query(
+  const { rows: frozen } = await platformPool.query(
     `UPDATE organizations SET subscription_status='frozen', updated_at=now()
       WHERE subscription_status='trial' AND trial_ends_at IS NOT NULL AND trial_ends_at < now()
       RETURNING id, name`
@@ -68,7 +80,7 @@ async function sweepExpiries() {
       'Please subscribe to continue using MY PT STUDIO. Your data is safe.', '/subscription');
   }
 
-  const { rows: expired } = await pool.query(
+  const { rows: expired } = await platformPool.query(
     `UPDATE organizations SET subscription_status='expired', updated_at=now()
       WHERE subscription_status='active' AND current_period_end IS NOT NULL AND current_period_end < now()
       RETURNING id, name`
@@ -88,7 +100,7 @@ async function sendReminders() {
   let sent = 0;
   for (const days of REMINDER_DAYS) {
     // Trials ending in `days` days.
-    const { rows: trials } = await pool.query(
+    const { rows: trials } = await platformPool.query(
       `SELECT id, name FROM organizations
         WHERE subscription_status='trial' AND trial_ends_at IS NOT NULL
           AND (trial_ends_at::date - CURRENT_DATE) = $1`, [days]
@@ -103,7 +115,7 @@ async function sendReminders() {
     }
 
     // Active subscriptions renewing in `days` days.
-    const { rows: subs } = await pool.query(
+    const { rows: subs } = await platformPool.query(
       `SELECT id, name FROM organizations
         WHERE subscription_status='active' AND current_period_end IS NOT NULL
           AND (current_period_end::date - CURRENT_DATE) = $1`, [days]

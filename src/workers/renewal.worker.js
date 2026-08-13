@@ -21,6 +21,10 @@
 
 const { Worker } = require('bullmq');
 const pool = require('../db/pool');
+// Tier three (migration 163). Used for exactly one query in this file: the
+// enumeration of organizations, which is a platform operation because it is
+// what decides which tenant contexts exist. Everything else stays on `pool`.
+const platformPool = require('../db/platformPool');
 const notifier = require('../modules/notifications/notifications.service');
 const razorpay = require('../lib/razorpay');
 const logger = require('../lib/logger');
@@ -57,10 +61,22 @@ const REMINDER_DAYS = [7, 3, 1];   // send reminder when this many days remain
  * caught and logged individually.
  */
 async function forEachOrganization(label, fn) {
-  // organizations carries no organization_id and no policy, so this runs
-  // without a tenant context by design — it is the platform-level query that
-  // establishes which contexts exist.
-  const { rows: orgs } = await pool.query(
+  // The platform pool, not the tenant one. This is the query that establishes
+  // which tenant contexts exist, so by definition it cannot run inside one.
+  //
+  // The comment here used to say organizations "carries no organization_id and
+  // no policy", and that was true when it was written. Migration 131 then gave
+  // every table in public a deny-all policy, and 157 only granted an exception
+  // to tables that have an organization_id — which organizations does not. So
+  // as app_tenant this returned zero rows and the loop below never ran: every
+  // sweep logged "organizations: 0" and did nothing, for every studio, in
+  // silence. Measured against the local database: 0 rows as app_tenant, 41 as
+  // app_platform.
+  //
+  // Only the enumeration moves. Each organization's own work stays on the
+  // tenant pool inside runWithTenantContext, so RLS remains the backstop for
+  // everything that touches a studio's data.
+  const { rows: orgs } = await platformPool.query(
     `SELECT id, name FROM organizations WHERE status = 'active' ORDER BY id`
   );
   let ok = 0, failed = 0;
