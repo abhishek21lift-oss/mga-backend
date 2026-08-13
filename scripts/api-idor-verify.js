@@ -256,6 +256,70 @@ const urlFor = (db, user, pw) => {
       pass: !leaked });
   }
 
+  // ── Exports and generated documents ────────────────────────────────────
+  //
+  // Phase 5K. An export is the one place where a tenant's data leaves the
+  // database as a file, so an authorisation slip here is not "one row" — it is
+  // the whole table, in a format built for taking away. These endpoints stream
+  // a PDF or CSV rather than JSON, which also means a leak would not be caught
+  // by any assertion that inspects res.body.
+  head('STEP 17 — exports and generated documents');
+  {
+    // The validity gate first, exactly as everywhere else in this file: prove
+    // A can export its OWN client before trusting any refusal. Without this a
+    // broken route returns 404 to everyone and every denial below is vacuous.
+    const own = await asA(request(app).get(`/api/pt-os/clients/${clientA}/enrollment-pdf`));
+    const ownWorks = own.status === 200;
+    check({ method: 'GET', route: '/api/pt-os/clients/:id/enrollment-pdf',
+      scenario: 'A exports its OWN client (validity gate)',
+      expected: '200 — otherwise the denials below prove nothing',
+      actual: String(own.status), pass: ownWorks });
+
+    if (ownWorks) {
+      const cross = await asA(request(app).get(`/api/pt-os/clients/${clientB}/enrollment-pdf`));
+      // A PDF is bytes, not JSON: check the payload itself for B's name, so a
+      // 200 carrying B's data cannot pass as success.
+      const bytes = Buffer.isBuffer(cross.body) ? cross.body.toString('latin1')
+        : JSON.stringify(cross.body || '') + String(cross.text || '');
+      const leaked = bytes.includes(`B Client ${run}`);
+      check({ method: 'GET', route: '/api/pt-os/clients/:idOfB/enrollment-pdf',
+        scenario: "A exports B's client as a PDF",
+        expected: 'denied or empty, and no B identifiers in the bytes',
+        actual: `${cross.status}${leaked ? ' LEAKED B DATA' : ' clean'}`,
+        pass: !leaked && cross.status !== 200 });
+    }
+
+    // Receipts are generated from a payment order. The order lookup is the
+    // authorisation point; everything downstream is derived from that row.
+    for (const path of [`/api/payments/upi/${clientB}/receipt`]) {
+      const res = await asA(request(app).get(path));
+      if (res.status === 404 || res.status === 400) {
+        check({ method: 'GET', route: '/api/payments/upi/:idOfB/receipt',
+          scenario: 'A downloads a receipt scoped to B',
+          expected: 'not found for A', actual: String(res.status), pass: true });
+        continue;
+      }
+      const bytes = Buffer.isBuffer(res.body) ? res.body.toString('latin1')
+        : JSON.stringify(res.body || '') + String(res.text || '');
+      check({ method: 'GET', route: '/api/payments/upi/:idOfB/receipt',
+        scenario: 'A downloads a receipt scoped to B',
+        expected: 'denied, and no B identifiers in the bytes',
+        actual: `${res.status}${bytes.includes(`B Client ${run}`) ? ' LEAKED B DATA' : ' clean'}`,
+        pass: !bytes.includes(`B Client ${run}`) && res.status !== 200 });
+    }
+
+    // Platform exports: a tenant admin must not reach the CSV that spans every
+    // organisation on the platform.
+    for (const path of ['/api/super-admin/billing/invoices.csv',
+                        '/api/super-admin/operations/audit-log.csv']) {
+      const res = await asA(request(app).get(path));
+      if (res.status === 404) continue;
+      check({ method: 'GET', route: path, scenario: 'tenant admin reaches a platform export',
+        expected: '401/403', actual: String(res.status),
+        pass: res.status === 401 || res.status === 403 });
+    }
+  }
+
   head('STEP 20 — super-admin routes refuse a tenant admin');
   for (const path of ['/api/admin/organizations', '/api/platform/organizations', '/api/admin/users']) {
     const res = await asA(request(app).get(path));
