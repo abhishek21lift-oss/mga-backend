@@ -80,8 +80,10 @@ const urlFor = (db, user, pw) => {
     (await admin.query(
       `INSERT INTO organizations (name, slug, status) VALUES ($1,$2,'active') RETURNING id`,
       [name, slug])).rows[0].id;
-  const A = await mkOrg('619 Fitness Studio', `idor-a-${run}`);
-  const B = await mkOrg('ABC Fitness', `idor-b-${run}`);
+  // Synthetic names only. The old-brand string that used to be here is
+  // exactly what must never appear in this product's data.
+  const A = await mkOrg('Test Gym A', `idor-a-${run}`);
+  const B = await mkOrg('Test Gym B', `idor-b-${run}`);
 
   // Same role for both, so any difference is tenancy and not privilege.
   const mkUser = async (orgId, tag) => {
@@ -317,6 +319,78 @@ const urlFor = (db, user, pw) => {
       check({ method: 'GET', route: path, scenario: 'tenant admin reaches a platform export',
         expected: '401/403', actual: String(res.status),
         pass: res.status === 401 || res.status === 403 });
+    }
+  }
+
+  // ── Gateway transactions (Phase 6H-B2) ────────────────────────────────
+  //
+  // The Razorpay callback is unauthenticated, so it cannot carry a tenant and
+  // must not be able to choose one. gateway_record_event resolves the
+  // organisation from the row a trusted path created; these assertions run the
+  // function as app_tenant, the same role the webhook uses, against two real
+  // organisations.
+  head('STEP 30 — gateway transaction tenant safety');
+  {
+    // Its own privileged client: the harness closes `admin` once the fixtures
+    // are built, well before this step runs.
+    const seed = new Client({ connectionString: urlFor(DB) });
+    await seed.connect();
+    const g = new Client({ connectionString: process.env.DATABASE_URL });
+    await g.connect();
+    try {
+      const payA = `pay_A_${run}`;
+      const payB = `pay_B_${run}`;
+      for (const [org, pid] of [[A, payA], [B, payB]]) {
+        await seed.query(
+          `INSERT INTO gateway_transactions (organization_id, provider, provider_payment_id, amount)
+           VALUES ($1,'razorpay',$2,100) ON CONFLICT DO NOTHING`, [org, pid]);
+      }
+      const rec = (pid, ev) => g.query(
+        "SELECT * FROM gateway_record_event('razorpay',$1,$2,'captured','{}'::jsonb)", [pid, ev]);
+
+      const a1 = (await rec(payA, `evt_a_${run}`)).rows[0];
+      check({ method: 'FN', route: 'gateway_record_event', scenario: "A's event resolves A",
+        expected: `applied + org ${A}`, actual: `applied=${a1.applied} org=${a1.organization_id}`,
+        pass: a1.applied === true && a1.organization_id === A });
+
+      // The property the whole design rests on: a provider id can only ever
+      // reach the organisation that owns it.
+      check({ method: 'FN', route: 'gateway_record_event', scenario: "A's event cannot resolve B",
+        expected: `never org ${B}`, actual: String(a1.organization_id),
+        pass: a1.organization_id !== B });
+
+      const dup = (await rec(payA, `evt_a_${run}`)).rows[0];
+      check({ method: 'FN', route: 'gateway_record_event', scenario: 'duplicate event id',
+        expected: 'applied=false, no second mutation', actual: `applied=${dup.applied}`,
+        pass: dup.applied === false });
+
+      const unknown = (await rec(`pay_nope_${run}`, `evt_x_${run}`)).rows[0];
+      check({ method: 'FN', route: 'gateway_record_event', scenario: 'unknown provider payment id',
+        expected: 'fails closed, no tenant invented',
+        actual: `applied=${unknown.applied} id=${unknown.transaction_id}`,
+        pass: unknown.applied === false && unknown.transaction_id === null });
+
+      const b1 = (await rec(payB, `evt_b_${run}`)).rows[0];
+      check({ method: 'FN', route: 'gateway_record_event', scenario: "B's event resolves B",
+        expected: `org ${B}`, actual: String(b1.organization_id), pass: b1.organization_id === B });
+
+      const { rows: [bRow] } = await seed.query(
+        'SELECT last_event_id FROM gateway_transactions WHERE provider_payment_id = $1', [payB]);
+      check({ method: 'FN', route: 'gateway_transactions', scenario: "B's row after all A traffic",
+        expected: 'untouched by A', actual: String(bRow.last_event_id),
+        pass: bRow.last_event_id === `evt_b_${run}` });
+
+      const { rows: [dupes] } = await seed.query(
+        'SELECT count(*)::int AS n FROM gateway_transactions WHERE provider_payment_id = $1', [payA]);
+      check({ method: 'FN', route: 'gateway_transactions', scenario: 'replay creates no second row',
+        expected: '1', actual: String(dupes.n), pass: dupes.n === 1 });
+
+      const { rows: [vis] } = await g.query('SELECT count(*)::int AS n FROM gateway_transactions');
+      check({ method: 'SELECT', route: 'gateway_transactions', scenario: 'app_tenant reads without tenant context',
+        expected: '0 rows — RLS strict', actual: String(vis.n), pass: vis.n === 0 });
+    } finally {
+      await g.end();
+      await seed.end();
     }
   }
 
