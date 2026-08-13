@@ -81,18 +81,45 @@ behaviour so the change has to be made deliberately rather than by accident.
 construction. It always returns the same 1×1 GIF whether or not the id exists,
 and swallows write errors, so it is not an existence oracle.
 
+## Razorpay persistence — resolved in 6H-B2
+
+The handler no longer writes `payments`. It calls `gateway_record_event()`
+(migration 164), passing provider identifiers and nothing else:
+
+```
+raw body → HMAC-SHA256 → parse → provider payment id → gateway_record_event()
+```
+
+The function is SECURITY DEFINER because the callback is unauthenticated:
+`app.org_id` is never set on that path, so `gateway_transactions`' strict
+policy correctly refuses a direct write. `search_path` is pinned to
+`public, pg_temp`, PUBLIC EXECUTE is revoked, and only `app_tenant` may call
+it. **It has no `organization_id` parameter** — the tenant is read from the row
+it finds, so a forged value in a signed payload has nowhere to go.
+
+Response semantics, each verified:
+
+| Condition | Response |
+|-----------|----------|
+| Bad or missing signature | 400, never reaches persistence |
+| Malformed JSON | 400 |
+| Handled event with no payment id | 400 — malformed, retry cannot help |
+| Unhandled event type | 200 `applied:false` |
+| Unknown provider payment id | 200 `applied:false` — fail closed |
+| Duplicate event id | 200 `applied:false` |
+| Database fault | **500** — the provider must retry |
+
+Idempotency has two independent controls: `last_event_id` inside the function
+(row locked `FOR UPDATE`, so concurrent deliveries cannot both decide they are
+first), and `UNIQUE (provider, provider_payment_id)` on the table. Removing the
+function's check still leaves the constraint — demonstrated by mutation, where
+the duplicate-event assertion failed but "no duplicate row" still passed.
+
+Covered by `api-idor-verify.js` STEP 30, inside the existing CI gate: 34/34.
+
+**The legacy business ledger is NOT solved by this.** See FINANCE-DOMAIN.md.
+
 ## Known limitations
-
-Two of the three callbacks cannot currently complete their write, and both are
-schema problems rather than callback problems.
-
-**Razorpay — HIGH.** `payments` has none of the columns the handler writes:
-`gateway_payment_id`, `gateway_status`, `gateway_payload`, `refund_id`. Every
-event raises `42703`. Verified against a real `app_tenant` connection with
-`TENANT_RLS_ENFORCE=on`. It now fails loudly rather than silently. `payments`
-also has no `organization_id` at all, so the canonical finance model has to be
-settled before this can be fixed — deferred to Phase 6H, deliberately not
-invented here.
 
 **Google Calendar — MEDIUM.** `google_calendar_tokens` has no
 `organization_id`, so migration 157 gave it no `tenant_isolation` policy and
@@ -115,9 +142,47 @@ Covered by the existing `test` and `api-idor` gates rather than a new job:
 - `webhook.security.test.js` — 14 assertions, Razorpay
 - `oauthCallback.security.test.js` — 12 assertions, Calendar
 - `razorpayWebhook.test.js` — pre-existing suite
-- `api-idor-verify.js` — 26 assertions, runs as `app_tenant` with
-  `TENANT_RLS_ENFORCE=on`
+- `api-idor-verify.js` — 34 assertions including STEP 30 (gateway tenant
+  safety), runs as `app_tenant` with `TENANT_RLS_ENFORCE=on`
 
 Mutation-tested: rewriting the Razorpay handler to scope its `UPDATE` by
 `event.organization_id` fails the suite, including the tenant-forgery
 assertion. Restored, all green, diff clean.
+
+## Test environment secret isolation
+
+Not a webhook concern, but it was found while chasing one and it governs every
+security claim in this document: a test that can reach production proves
+nothing about isolation.
+
+`src/db/pool.js` is required by 129 files and called `dotenv.config()` at
+import, so a single unmocked suite pulled the repository `.env` into the Jest
+worker. Measured before the fix:
+
+```
+DATABASE_URL before requiring db/pool : unset
+DATABASE_URL after                    : <production pooler host>
+pool.totalCount                       : 1
+```
+
+A live connection to production, from a unit test. `.env` also carries
+`JWT_SECRET`, which is worse: whatever reads it can mint a valid session for
+any tenant.
+
+The rules, enforced by `src/__tests__/testEnv.isolation.test.js`:
+
+1. Jest never loads the repository `.env` — `pool.js` skips dotenv under
+   `NODE_ENV=test`, so in a worker there is nothing to load.
+2. `jest.setup.env.js` pins the three database URLs, `JWT_SECRET` and
+   `FRONTEND_URL` before any module loads. Environment-provided values win, so
+   CI and the `scripts/` harnesses keep their explicit contracts.
+3. A test failure is never fixed by pointing a test at a real database.
+4. No production database connection from Jest — asserted via
+   `pool.totalCount === 0`.
+5. No provider credentials in the worker; adding one has to be a deliberate,
+   visible change to that test.
+
+The isolation test is mutation-proven: with both controls removed it fails on
+the production host. With only one removed it passes, because the two are
+redundant for pinned keys — the dotenv guard is what protects keys nobody
+thought to pin.
