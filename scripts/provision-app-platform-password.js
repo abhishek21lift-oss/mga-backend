@@ -49,6 +49,19 @@ if (!/^[\x21-\x7e]+$/.test(password)) {
 const NEEDS_ENCODING = /[:/?#[\]@%&=+$,; ]/.test(password);
 const ssl = (u) => (/sslmode=disable/.test(u) ? false : { rejectUnauthorized: false });
 
+/**
+ * Is the target on this machine? Same question migrate.js's remote guard asks,
+ * and for a related reason: the probes below that name real application tables
+ * are worth running against a scratch database and not worth running against
+ * the one holding every tenant.
+ */
+const LOCAL_HOSTS = new Set([
+  'localhost', '127.0.0.1', '::1', '0.0.0.0', 'host.docker.internal', 'postgres', 'db',
+]);
+const IS_LOCAL_TARGET = (() => {
+  try { return LOCAL_HOSTS.has(new URL(dbUrl).hostname); } catch { return false; }
+})();
+
 const FLAGS = `
   SELECT rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, rolreplication, rolcanlogin,
          has_schema_privilege($1,'public','CREATE') AS create_on_public,
@@ -60,6 +73,29 @@ const ROLE_CENSUS = `
          rolreplication, rolbypassrls, rolconnlimit, rolvaliduntil,
          (rolpassword IS NOT NULL) AS has_password
     FROM pg_authid ORDER BY rolname`;
+
+/**
+ * Everything 163 established, fingerprinted.
+ *
+ * ALTER ROLE ... PASSWORD cannot alter a grant or a policy, so in principle
+ * this confirms something the statement already guarantees. It is here anyway
+ * because "the only statement I run cannot do that" is a claim about the code,
+ * and this is a measurement of the database — and because the run that matters
+ * is against a database holding every tenant on the platform. The counts also
+ * catch the case this cannot: somebody else changing things concurrently.
+ */
+const GRANT_CENSUS = `
+  SELECT (SELECT count(*) FROM information_schema.role_table_grants
+           WHERE grantee = '${ROLE}')                                        AS grants,
+         (SELECT count(*) FROM pg_policies
+           WHERE schemaname='public' AND policyname LIKE 'platform\\_%')      AS platform_policies,
+         (SELECT count(*) FROM pg_policies
+           WHERE schemaname='public' AND policyname = 'tenant_isolation')    AS tenant_policies,
+         (SELECT md5(string_agg(table_name||':'||privilege_type, ',' ORDER BY table_name, privilege_type))
+            FROM information_schema.role_table_grants WHERE grantee='${ROLE}') AS grant_fingerprint,
+         (SELECT md5(string_agg(tablename||':'||policyname||':'||cmd||':'||coalesce(qual,'')||':'||coalesce(with_check,''),
+                                ',' ORDER BY tablename, policyname))
+            FROM pg_policies WHERE schemaname='public')                      AS policy_fingerprint`;
 
 function deriveUrl(privilegedUrl, plaintext) {
   const u = new URL(privilegedUrl);
@@ -93,6 +129,7 @@ function deriveUrl(privilegedUrl, plaintext) {
     }
 
     const rolesBefore = (await admin.query(ROLE_CENSUS)).rows;
+    const { rows: [privBefore] } = await admin.query(GRANT_CENSUS);
 
     await admin.query(
       `ALTER ROLE ${ROLE} WITH PASSWORD ${admin.escapeLiteral(scramVerifier(password, DEFAULT_ITERATIONS))}`
@@ -122,6 +159,14 @@ function deriveUrl(privilegedUrl, plaintext) {
       }
     }
 
+    // Not one grant, not one policy. Compared by fingerprint rather than
+    // count, so a swap that preserves the totals is still caught.
+    const { rows: [privAfter] } = await admin.query(GRANT_CENSUS);
+    for (const k of ['grants', 'platform_policies', 'tenant_policies',
+      'grant_fingerprint', 'policy_fingerprint']) {
+      if (String(privBefore[k]) !== String(privAfter[k])) fail(`${k} changed — aborting`);
+    }
+
     target = deriveUrl(dbUrl, password);
 
     console.log(`✓ ${ROLE} password set`);
@@ -130,7 +175,12 @@ function deriveUrl(privilegedUrl, plaintext) {
     for (const f of mustBeFalse) console.log(`    ${f.replace('rol', '').padEnd(13)}: ${post[f]}`);
     console.log(`    ${'LOGIN'.padEnd(13)}: ${post.rolcanlogin}   (required true)`);
     console.log(`    ${'CREATE public'.padEnd(13)}: ${post.create_on_public}   (required false)`);
-    console.log(`    other roles modified: 0 of ${rolesAfter.length - 1}`);
+    console.log('');
+    console.log('  unchanged by this script');
+    console.log(`    table grants to ${ROLE} : ${privAfter.grants} (fingerprint identical)`);
+    console.log(`    platform_* policies      : ${privAfter.platform_policies} (fingerprint identical)`);
+    console.log(`    tenant_isolation policies: ${privAfter.tenant_policies}`);
+    console.log(`    other roles modified     : 0 of ${rolesAfter.length - 1}`);
   } finally {
     await admin.end();
   }
@@ -171,13 +221,27 @@ function deriveUrl(privilegedUrl, plaintext) {
     };
 
     await probe.query('BEGIN');
+
+    // Harmless whatever the answer: each either fails on a privilege check or
+    // creates a throwaway object inside a transaction that is rolled back.
     await mustFail('CREATE TABLE', 'CREATE TABLE platform_probe_should_fail(id int)');
     await mustFail('CREATE SCHEMA', 'CREATE SCHEMA platform_probe_should_fail');
-    await mustFail('DROP TABLE organizations', 'DROP TABLE public.organizations');
-    await mustFail('ALTER TABLE users', 'ALTER TABLE public.users ADD COLUMN probe_col int');
-    await mustFail('DELETE FROM users', 'DELETE FROM public.users');
-    await mustFail('DELETE FROM organizations', 'DELETE FROM public.organizations');
     await mustFail('SET ROLE app_tenant', 'SET ROLE app_tenant');
+
+    // These four name real application tables. PostgreSQL refuses them on the
+    // privilege check before a row is read, and the transaction is rolled back
+    // either way — but a DROP TABLE organizations issued against the live
+    // database is not something to do for a nicer console output. They ran
+    // against a local database built by this same migration 163, which is
+    // where that evidence belongs.
+    if (IS_LOCAL_TARGET) {
+      await mustFail('DROP TABLE organizations', 'DROP TABLE public.organizations');
+      await mustFail('ALTER TABLE users', 'ALTER TABLE public.users ADD COLUMN probe_col int');
+      await mustFail('DELETE FROM users', 'DELETE FROM public.users');
+      await mustFail('DELETE FROM organizations', 'DELETE FROM public.organizations');
+    } else {
+      denied.push('DROP/ALTER/DELETE on application tables → skipped (remote target)');
+    }
 
     // Chosen at run time rather than hardcoded. A named table that has since
     // been dropped would fail with 42P01 "does not exist", which looks like a
