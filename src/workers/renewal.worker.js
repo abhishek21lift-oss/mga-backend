@@ -153,6 +153,36 @@ async function autoRenewForOrg(orgId) {
         : null;
       const charge = payment || { id: order.id, status: order.status, amount: m.price };
 
+      // 1b. Record the gateway transaction (migration 164).
+      //
+      // This is the producer the webhook depends on. gateway_record_event
+      // resolves a tenant by finding the row created here; without it a
+      // signed, genuine Razorpay event has nothing to attach to and is
+      // correctly refused as an unknown payment.
+      //
+      // orgId is the trusted value from forEachOrganization's platform
+      // enumeration, not anything a request supplied. The surrounding
+      // transaction already carries app.org_id — pool.connect() injects it on
+      // BEGIN inside runWithTenantContext — so this INSERT satisfies the
+      // table's strict policy rather than working around it.
+      //
+      // payment_order_id stays NULL: the renewal flow charges directly and
+      // never creates a payment_orders row. The column is nullable in 164 for
+      // exactly this case.
+      //
+      // ON CONFLICT DO NOTHING because a retried sweep must not fail on a
+      // charge it already recorded; the unique key is (provider,
+      // provider_payment_id).
+      await client.query(
+        `INSERT INTO gateway_transactions
+           (organization_id, provider, provider_payment_id, provider_order_id,
+            status, amount, currency)
+         VALUES ($1, 'razorpay', $2, $3, $4, $5, 'INR')
+         ON CONFLICT (provider, provider_payment_id) DO NOTHING`,
+        [orgId, charge.id, order.id,
+         charge.status === 'captured' ? 'captured' : 'created', m.price],
+      );
+
       // 2. Create new membership
       const newEnd = new Date();
       newEnd.setDate(newEnd.getDate() + m.duration);
