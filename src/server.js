@@ -708,8 +708,39 @@ app.use(errorHandler);
 // ────────────────────────
 const { runMigrationsWithRetry } = require('./db/migrate');
 
-logger.info('Running database migrations…');
-runMigrationsWithRetry()
+// Migrating on boot is a deploy step, not a development one.
+//
+// Applying schema changes to whatever database a laptop happens to point at,
+// every time nodemon restarts, was never the intent — it only looked harmless
+// while DATABASE_URL and MIGRATION_DATABASE_URL were the same local database.
+// They are not any more: MIGRATION_DATABASE_URL names the privileged role, it
+// lives in .env, and migrate.js now refuses a remote target outside production.
+// So `npm run dev` boots straight into that refusal and stops.
+//
+// The gate is `=== 'production'` rather than `!== 'development'` because
+// `npm run dev` sets no NODE_ENV at all — it is `nodemon src/server.js`. A
+// check for the literal string 'development' would leave the common case
+// exactly as broken as it is now while looking like it had been fixed.
+// Deploys are unaffected: the Dockerfile sets NODE_ENV=production, and this is
+// the same idiom migrate.js, platformPool.js and logger.js already use.
+//
+// Nothing else moves. The promise below is resolved rather than skipped, so
+// AI settings, workers and listen() still happen in the same order, once.
+const RUN_STARTUP_MIGRATIONS = process.env.NODE_ENV === 'production';
+
+let startupMigrations;
+if (RUN_STARTUP_MIGRATIONS) {
+  logger.info('Running database migrations…');
+  startupMigrations = runMigrationsWithRetry();
+} else {
+  logger.info(
+    { nodeEnv: process.env.NODE_ENV || 'unset' },
+    'skipping startup migrations (not production) — run them deliberately with `npm run migrate`',
+  );
+  startupMigrations = Promise.resolve();
+}
+
+startupMigrations
   .then(function() {
     // Start polling the operator's AI model overrides. After migrations, so
     // the table is guaranteed to exist; before listen, so the first request
