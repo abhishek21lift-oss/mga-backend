@@ -8,6 +8,7 @@ const crypto  = require('crypto');
 const pool    = require('../db/pool');
 const logger  = require('../lib/logger');
 
+const PROVIDER = 'razorpay';
 const WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || '';
 
 // Raw-body middleware for this route only — must come before json parsing.
@@ -48,46 +49,62 @@ router.post('/', async (req, res) => {
   const eventType = event?.event;
   logger.info({ eventType }, 'Razorpay webhook received');
 
+  // ── Provider identifiers only ────────────────────────────────────────
+  //
+  // Nothing tenant-shaped is read from this message. gateway_record_event
+  // (migration 164) resolves the organisation from the gateway_transactions
+  // row that a trusted, authenticated path created when the charge was
+  // initiated, and it has no organization_id parameter — so a forged one in
+  // the payload has nowhere to go.
+  //
+  // This replaces three UPDATEs against `payments` that could never have
+  // worked: they matched on gateway_payment_id, while the only writer —
+  // renewal.worker.js — records gateway_txn_id. Different columns, and both
+  // absent from the schema anyway.
+  const entity = event.payload?.payment?.entity;
+  const refund = event.payload?.refund?.entity;
+
+  const MAPPING = {
+    'payment.captured': () => ({ paymentId: entity?.id, status: 'captured', payload: entity }),
+    'payment.failed':   () => ({ paymentId: entity?.id, status: 'failed',   payload: entity }),
+    'refund.processed': () => ({ paymentId: refund?.payment_id, status: 'refunded',
+                                 payload: refund, refundId: refund?.id }),
+  };
+
+  const mapped = MAPPING[eventType]?.();
+
+  // Razorpay sends many event types this application has no domain effect
+  // for. Acknowledging them is safe precisely because nothing was meant to
+  // change; a 5xx would only ask the provider to resend something we will
+  // ignore again.
+  if (!mapped) return res.json({ received: true, applied: false, reason: 'unhandled_event' });
+
+  // A handled event with no payment id is malformed. 4xx, not 5xx: resending
+  // the same broken payload cannot help.
+  if (!mapped.paymentId) return res.status(400).json({ error: 'Event carries no payment id' });
+
   try {
-    if (eventType === 'payment.captured') {
-      const payment = event.payload?.payment?.entity;
-      if (payment?.id) {
-        await pool.query(
-          `UPDATE payments
-              SET gateway_status = 'captured',
-                  gateway_payload = $2,
-                  updated_at = NOW()
-            WHERE gateway_payment_id = $1`,
-          [payment.id, JSON.stringify(payment)],
-        );
-      }
-    } else if (eventType === 'payment.failed') {
-      const payment = event.payload?.payment?.entity;
-      if (payment?.id) {
-        await pool.query(
-          `UPDATE payments
-              SET gateway_status = 'failed',
-                  gateway_payload = $2,
-                  updated_at = NOW()
-            WHERE gateway_payment_id = $1`,
-          [payment.id, JSON.stringify(payment)],
-        );
-      }
-    } else if (eventType === 'refund.processed') {
-      const refund = event.payload?.refund?.entity;
-      if (refund?.payment_id) {
-        await pool.query(
-          `UPDATE payments
-              SET gateway_status = 'refunded',
-                  refund_id = $2,
-                  updated_at = NOW()
-            WHERE gateway_payment_id = $1`,
-          [refund.payment_id, refund.id],
-        );
-      }
+    const { rows } = await pool.query(
+      `SELECT transaction_id, organization_id, applied
+         FROM gateway_record_event($1,$2,$3,$4,$5,$6)`,
+      [PROVIDER, mapped.paymentId, event.id || null, mapped.status,
+       JSON.stringify(mapped.payload || {}), mapped.refundId || null],
+    );
+    const result = rows[0] || {};
+
+    if (!result.transaction_id) {
+      // No local transaction for this provider id. Fail closed — inventing a
+      // row would mean inventing a tenant to own it. 200 because this is a
+      // permanent condition: retrying will not conjure the transaction.
+      logger.warn({ eventType }, 'razorpay event for an unknown provider payment id');
+      return res.json({ received: true, applied: false, reason: 'unknown_payment' });
     }
-    // Unknown event types are acknowledged but ignored
-    res.json({ received: true });
+
+    // applied === false means this exact event id was already recorded. 200 is
+    // both correct and necessary: the state the provider wanted is durable, and
+    // it should stop resending.
+    logger.info({ eventType, applied: result.applied }, 'razorpay gateway event recorded');
+    return res.json({ received: true, applied: result.applied });
   } catch (err) {
     logger.error({ err: err.message, eventType }, 'Razorpay webhook handler error');
     // 500, not 200.
@@ -99,10 +116,11 @@ router.post('/', async (req, res) => {
     // failed write became permanent silent data loss with a log line as its
     // only trace.
     //
-    // That is not theoretical here. `payments` carries none of the columns
-    // this file writes (gateway_payment_id, gateway_status, gateway_payload,
-    // refund_id), so today every capture, failure and refund raises 42703 and
-    // is dropped. The 200 is what let that survive unnoticed.
+    // It was not theoretical: this route used to write columns `payments`
+    // does not have, so every event raised 42703 and was acknowledged anyway.
+    // Persistence now goes through gateway_record_event (migration 164), so
+    // this branch is back to meaning what it should — a genuine, probably
+    // transient, database fault.
     //
     // A 5xx makes Razorpay retry, which is right for a transient fault and
     // makes a permanent one loud instead of invisible. Signature and payload

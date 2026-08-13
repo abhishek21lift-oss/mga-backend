@@ -9,7 +9,17 @@
 // dispatch of the three handled event types. Those are correct in the current
 // implementation and this pins them.
 //
-// ── What these tests deliberately do NOT claim ──────────────────────────────
+// ── Updated in 6H-B2 ────────────────────────────────────────────────────────
+//
+// The section below described a route that wrote to `payments` columns which
+// did not exist, and a Razorpay path that looked vestigial. That has been
+// resolved: migration 164 introduced gateway_transactions and the SECURITY
+// DEFINER gateway_record_event(), and this route now persists through it. The
+// original note is kept because it records why the old assertions looked the
+// way they did — and because it was right that choosing the table was a
+// product decision, which is what 6H settled.
+//
+// ── What the original note said ─────────────────────────────────────────────
 //
 // They do not assert the handler bodies work, because they cannot. Every
 // UPDATE in this route writes to `payments` columns that do not exist in this
@@ -46,6 +56,14 @@ const mockQueries = [];
 jest.mock('../db/pool', () => ({
   query: jest.fn(async (sql, params) => {
     mockQueries.push({ sql: String(sql).replace(/\s+/g, ' ').trim(), params });
+    // Implements gateway_record_event's real signature: it RETURNS TABLE
+    // (transaction_id, organization_id, applied). Returning a bare rowCount
+    // would let the route's "unknown payment" branch pass for the wrong
+    // reason, so the default here is a transaction that exists and applied.
+    if (/gateway_record_event/i.test(String(sql))) {
+      return { rows: [{ transaction_id: 'txn-default', organization_id: 'org-default', applied: true }],
+               rowCount: 1 };
+    }
     return { rows: [], rowCount: 1 };
   }),
 }));
@@ -96,7 +114,13 @@ const captured = (id = 'pay_ABC123') => JSON.stringify({
   payload: { payment: { entity: { id, amount: 50000, status: 'captured' } } },
 });
 
-const writes = () => mockQueries.filter((q) => /UPDATE payments/i.test(q.sql));
+// A "write" is now a call to the canonical persistence function. The route no
+// longer issues DML of its own: gateway_record_event owns the mutation, so
+// reaching it is exactly the observable that used to be "an UPDATE ran".
+const writes = () => mockQueries.filter((q) => /gateway_record_event/i.test(q.sql));
+
+/** Positional arguments of gateway_record_event: see migration 164. */
+const ARG = { provider: 0, paymentId: 1, eventId: 2, status: 3, payload: 4, refundId: 5 };
 
 beforeEach(() => {
   mockQueries.length = 0;
@@ -181,7 +205,7 @@ describe('the signature gate', () => {
     const res = await post(appWithSecret(SECRET), body, sign(body));
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ received: true });
+    expect(res.body).toEqual({ received: true, applied: true });
   });
 
   test('rejects valid-signature-but-invalid-JSON', async () => {
@@ -201,8 +225,11 @@ describe('event dispatch', () => {
     await send(captured('pay_CAPTURE_1'));
 
     const [q] = writes();
-    expect(q.sql).toMatch(/gateway_status = 'captured'/i);
-    expect(q.params[0]).toBe('pay_CAPTURE_1');
+    // Behaviour, not SQL text: the provider id and the lifecycle state the
+    // event means, handed to the function that owns the mutation.
+    expect(q.params[ARG.provider]).toBe('razorpay');
+    expect(q.params[ARG.paymentId]).toBe('pay_CAPTURE_1');
+    expect(q.params[ARG.status]).toBe('captured');
   });
 
   test('payment.failed marks the payment failed', async () => {
@@ -213,8 +240,8 @@ describe('event dispatch', () => {
     await send(body);
 
     const [q] = writes();
-    expect(q.sql).toMatch(/gateway_status = 'failed'/i);
-    expect(q.params[0]).toBe('pay_FAIL_1');
+    expect(q.params[ARG.paymentId]).toBe('pay_FAIL_1');
+    expect(q.params[ARG.status]).toBe('failed');
   });
 
   test('refund.processed keys off payment_id, not the refund id', async () => {
@@ -227,9 +254,11 @@ describe('event dispatch', () => {
     await send(body);
 
     const [q] = writes();
-    expect(q.sql).toMatch(/gateway_status = 'refunded'/i);
-    expect(q.params[0]).toBe('pay_REFUNDED_1');
-    expect(q.params[1]).toBe('rfnd_1');
+    // Keying on refund.id instead would address a transaction that does not
+    // exist, leaving the payment silently unrefunded.
+    expect(q.params[ARG.paymentId]).toBe('pay_REFUNDED_1');
+    expect(q.params[ARG.status]).toBe('refunded');
+    expect(q.params[ARG.refundId]).toBe('rfnd_1');
   });
 
   test('an unknown event type is acknowledged and ignored', async () => {
@@ -237,17 +266,23 @@ describe('event dispatch', () => {
     const res = await send(body);
 
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ received: true });
+    expect(res.body).toEqual({ received: true, applied: false, reason: 'unhandled_event' });
     expect(writes()).toHaveLength(0);
   });
 
-  test('a handled event with no payment entity writes nothing', async () => {
+  test('a handled event with no payment entity is rejected, not acknowledged', async () => {
     // Razorpay has sent malformed payloads before; a missing entity must not
-    // produce an UPDATE with an undefined id.
+    // reach the persistence function with an undefined id.
+    //
+    // This used to expect 200. It is 4xx now, and deliberately: a
+    // payment.captured carrying no payment IS malformed, and the route's
+    // contract is that malformed input is the caller's fault and must not be
+    // retried. Acknowledging it would also be indistinguishable from having
+    // processed it.
     const body = JSON.stringify({ event: 'payment.captured', payload: {} });
     const res = await send(body);
 
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(400);
     expect(writes()).toHaveLength(0);
   });
 });

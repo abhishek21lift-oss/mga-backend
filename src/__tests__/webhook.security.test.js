@@ -20,6 +20,11 @@
  * effect" assertions exact rather than inferred.
  */
 
+// The mock implements gateway_record_event's real signature — it RETURNS
+// TABLE (transaction_id, organization_id, applied). A bare empty result would
+// send every test down the route's "unknown payment" branch and let the
+// assertions below pass for the wrong reason.
+const GATEWAY_OK = { rows: [{ transaction_id: 'txn-1', organization_id: 'org-1', applied: true }], rowCount: 1 };
 jest.mock('../db/pool', () => ({ query: jest.fn().mockResolvedValue({ rows: [], rowCount: 0 }) }));
 
 const crypto = require('crypto');
@@ -38,7 +43,7 @@ function makeApp(secret = SECRET) {
   jest.resetModules();
   process.env.RAZORPAY_WEBHOOK_SECRET = secret;
   const pool = require('../db/pool');
-  pool.query.mockResolvedValue({ rows: [], rowCount: 0 });
+  pool.query.mockResolvedValue(GATEWAY_OK);
   const app = express();
   // Mounted exactly as server.js does: before any JSON parser, so the router's
   // own express.raw() sees the untouched bytes.
@@ -129,10 +134,13 @@ describe('Razorpay webhook — tenant identity cannot be supplied by the caller'
     // A valid signature proves the message came from Razorpay. It proves
     // nothing about which tenant it may act on, and the handler must not treat
     // it as if it did.
-    const [sql, args] = pool.query.mock.calls[0];
-    expect(sql).not.toMatch(/organization_id|org_id/i);
+    const [, args] = pool.query.mock.calls[0];
+    // gateway_record_event has no organization_id parameter at all, so the
+    // forged values cannot appear among the arguments — there is nowhere to
+    // put them. That is a stronger property than "the SQL was filtered".
     expect(JSON.stringify(args)).not.toContain('11111111-1111-1111-1111-111111111111');
     expect(JSON.stringify(args)).not.toContain('22222222-2222-2222-2222-222222222222');
+    expect(args).toHaveLength(6);
   });
 
   it('locates the row solely by the provider payment id', async () => {
@@ -142,9 +150,11 @@ describe('Razorpay webhook — tenant identity cannot be supplied by the caller'
 
     const [sql, args] = pool.query.mock.calls[0];
     // Razorpay allocates payment ids globally, so this identifies one row on
-    // the platform. Ownership follows from the row, not from the message.
-    expect(sql).toMatch(/WHERE gateway_payment_id = \$1/);
-    expect(args[0]).toBe('pay_ownership_1');
+    // the platform. Ownership follows from the row the function finds, not
+    // from anything in the message.
+    expect(sql).toMatch(/gateway_record_event/);
+    expect(args[0]).toBe('razorpay');
+    expect(args[1]).toBe('pay_ownership_1');
   });
 
   it('never establishes tenant context from the request', async () => {
@@ -165,11 +175,14 @@ describe('Razorpay webhook — unknown and repeated events', () => {
     expect(pool.query).not.toHaveBeenCalled();
   });
 
-  it('writes nothing when the event carries no payment id', async () => {
+  it('rejects a handled event that carries no payment id, and writes nothing', async () => {
     const { app, pool } = makeApp();
     const body = JSON.stringify({ event: 'payment.captured', payload: { payment: { entity: {} } } });
     const res = await post(app, body, sign(body));
-    expect(res.status).toBe(200);
+    // 4xx rather than the acknowledgement this used to expect: a
+    // payment.captured with no payment is malformed, it is the caller's
+    // fault, and retrying the same payload cannot help.
+    expect(res.status).toBe(400);
     expect(pool.query).not.toHaveBeenCalled();
   });
 
