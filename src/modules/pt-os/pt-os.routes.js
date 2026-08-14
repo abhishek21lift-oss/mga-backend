@@ -1029,13 +1029,31 @@ router.post('/payouts', auth, adminOnly, wrap(async (req, res) => {
 }));
 
 // Mark all pending payouts for a month as paid (MUST be before /:id/approve)
+// Scoped, and taken ahead of the rest of the commission/payout module.
+//
+// The wider defect is recorded as V-05 in TENANT_SECURITY_AUDIT.md and belongs
+// with Phase 8, where the trainers / pt_trainers split gets reconciled: today
+// every read path here resolves trainers through pt_trainers, which migration
+// 145 verified holds zero rows and which POST /trainers deliberately never
+// writes to, so the module is inert and its leaks are latent rather than live.
+//
+// This one statement is fixed now anyway, because it is the only write in the
+// module whose WHERE clause names no id at all. Every other unscoped query here
+// is bounded by a trainer or client id that a caller has to know; this one is
+// bounded by a month, which every tenant shares. If the analysis above is ever
+// wrong — pt_trainers gets populated, or a payout arrives by some path nobody
+// mapped — the blast radius is every studio's payout ledger for that month,
+// marked paid, with no record of who did it. One line is a cheap hedge against
+// that, and it costs nothing while the table stays empty.
 router.post('/payouts/mark-all-paid', auth, adminOnly, wrap(async (req, res) => {
   const month = req.body.month || new Date().toISOString().slice(0, 7);
   const monthStart = `${month}-01`;
+  const params = [monthStart];
+  const orgGuard = orgWhere(req, params);
   const { rowCount } = await pool.query(
     `UPDATE pt_payouts SET status = 'paid', paid_at = NOW(), updated_at = NOW()
-     WHERE month = $1 AND status != 'paid'`,
-    [monthStart]
+     WHERE month = $1 AND status != 'paid'${orgGuard}`,
+    params
   );
   res.json({ data: { updated: rowCount } });
 }));

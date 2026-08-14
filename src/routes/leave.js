@@ -6,6 +6,29 @@ const router = require('express').Router();
 const pool = require('../db/pool');
 const logger = require('../lib/logger');
 const { auth, adminOrManager } = require('../middleware/auth');
+const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+
+// Tenant predicate for leave_requests, aliased `lr` in the read queries and
+// unaliased in the writes.
+//
+// Every handler in this file used to address leave by id or trainer_id alone.
+// For a trainer that was survivable — the list route pins trainer_id to the
+// caller's own record — but there was no equivalent branch for admin or
+// manager, so `GET /api/leave` returned every studio's leave requests with
+// trainer name, email and phone attached, and approve/reject would act on any
+// row in the platform by id.
+//
+// This file was on the convention test's REVIEWED_EXCEPTIONS list, whose stated
+// reason covered the trainer self-lookup and the name-resolution join and did
+// not mention the admin path at all. The exemption was written about the joins
+// and quietly covered the leak beside them; it is removed in the same change
+// that adds these predicates.
+function orgFilter(req, params, alias = 'lr') {
+  const scope = tenantScope(req);
+  if (!scope.applyFilter) return '';
+  params.push(scope.orgId);
+  return `${alias ? alias + '.' : ''}organization_id = $${params.length}`;
+}
 
 // GET /api/leave — list leave requests
 // Filters: status, trainer_id, from, to
@@ -13,7 +36,12 @@ router.get('/', auth, async function(req, res) {
   try {
     const conditions = [];
     const params = [];
-    let idx = 1;
+
+    // Org predicate first, so the manual $-counter below starts after whatever
+    // it consumed rather than colliding with it.
+    const org = orgFilter(req, params);
+    if (org) conditions.push(org);
+    let idx = params.length + 1;
 
     if (req.query.status) {
       conditions.push('lr.status = $' + idx++);
@@ -85,12 +113,14 @@ router.get('/', auth, async function(req, res) {
 // GET /api/leave/:id — single leave request
 router.get('/:id', auth, async function(req, res) {
   try {
+    const params = [req.params.id];
+    const orgGuard = orgFilter(req, params);
     const { rows } = await pool.query(
       'SELECT lr.*, t.name AS trainer_name, t.email AS trainer_email ' +
       'FROM leave_requests lr ' +
       'LEFT JOIN trainers t ON t.id = lr.trainer_id ' +
-      'WHERE lr.id = $1',
-      [req.params.id]
+      'WHERE lr.id = $1' + (orgGuard ? ' AND ' + orgGuard : ''),
+      params
     );
 
     if (!rows[0]) return res.status(404).json({ error: 'Leave request not found' });
@@ -150,11 +180,32 @@ router.post('/', auth, async function(req, res) {
       }
     }
 
-    // Check for overlapping pending leave
+    // The trainer must belong to the caller's studio. Without this an admin
+    // could file leave against another studio's trainer: the row would land in
+    // the caller's org (stamped below) while pointing at a foreign trainer_id,
+    // which is the referential pollution lib/orgGuard.js exists to prevent for
+    // client ids. Same guard, different parent table.
+    {
+      const scope = tenantScope(req);
+      if (scope.applyFilter) {
+        const { rowCount } = await pool.query(
+          'SELECT 1 FROM trainers WHERE id = $1 AND organization_id = $2',
+          [trainer_id, scope.orgId]
+        );
+        if (!rowCount) return res.status(404).json({ error: 'Trainer not found' });
+      }
+    }
+
+    // Check for overlapping pending leave. Scoped too: an unscoped overlap
+    // check leaks by timing — a 409 tells the caller a foreign trainer has
+    // leave booked on those dates.
+    const overlapParams = [trainer_id, 'pending', to_date, from_date];
+    const overlapOrg = orgFilter(req, overlapParams, null);
     const { rows: overlap } = await pool.query(
       'SELECT id FROM leave_requests WHERE trainer_id = $1 AND status = $2 ' +
-      'AND from_date <= $3 AND to_date >= $4 LIMIT 1',
-      [trainer_id, 'pending', to_date, from_date]
+      'AND from_date <= $3 AND to_date >= $4' +
+      (overlapOrg ? ' AND ' + overlapOrg : '') + ' LIMIT 1',
+      overlapParams
     );
 
     if (overlap.length) {
@@ -162,10 +213,10 @@ router.post('/', auth, async function(req, res) {
     }
 
     const { rows } = await pool.query(
-      'INSERT INTO leave_requests (trainer_id, leave_type, from_date, to_date, reason) ' +
-      'VALUES ($1, $2, $3, $4, $5) ' +
+      'INSERT INTO leave_requests (trainer_id, leave_type, from_date, to_date, reason, organization_id) ' +
+      'VALUES ($1, $2, $3, $4, $5, $6) ' +
       'RETURNING *',
-      [trainer_id, leave_type || 'other', from_date, to_date, reason || '']
+      [trainer_id, leave_type || 'other', from_date, to_date, reason || '', orgIdOf(req)]
     );
 
     const r = rows[0];
@@ -191,11 +242,13 @@ router.post('/', auth, async function(req, res) {
 // POST /api/leave/:id/approve — approve leave
 router.post('/:id/approve', auth, adminOrManager, async function(req, res) {
   try {
+    const params = ['approved', req.user.id, req.body.admin_note || null, req.params.id, 'pending'];
+    const orgGuard = orgFilter(req, params, null);
     const { rows } = await pool.query(
       'UPDATE leave_requests SET status = $1, approved_by = $2, approved_at = NOW(), ' +
       'admin_note = COALESCE($3, admin_note), updated_at = NOW() ' +
-      'WHERE id = $4 AND status = $5 RETURNING *',
-      ['approved', req.user.id, req.body.admin_note || null, req.params.id, 'pending']
+      'WHERE id = $4 AND status = $5' + (orgGuard ? ' AND ' + orgGuard : '') + ' RETURNING *',
+      params
     );
 
     if (!rows[0]) {
@@ -212,11 +265,13 @@ router.post('/:id/approve', auth, adminOrManager, async function(req, res) {
 // POST /api/leave/:id/reject — reject leave
 router.post('/:id/reject', auth, adminOrManager, async function(req, res) {
   try {
+    const params = ['rejected', req.user.id, req.body.admin_note || null, req.params.id, 'pending'];
+    const orgGuard = orgFilter(req, params, null);
     const { rows } = await pool.query(
       'UPDATE leave_requests SET status = $1, approved_by = $2, ' +
       'admin_note = COALESCE($3, admin_note), updated_at = NOW() ' +
-      'WHERE id = $4 AND status = $5 RETURNING *',
-      ['rejected', req.user.id, req.body.admin_note || null, req.params.id, 'pending']
+      'WHERE id = $4 AND status = $5' + (orgGuard ? ' AND ' + orgGuard : '') + ' RETURNING *',
+      params
     );
 
     if (!rows[0]) {

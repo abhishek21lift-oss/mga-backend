@@ -661,10 +661,25 @@ function computeLifestyleAnalysis(b) {
   };
 }
 
+// Tenant-scoped, matching every sibling list route in this file.
+//
+// This one was not. `client_id` is optional, so the request that omits it built
+// no WHERE clause at all and the query was a bare `SELECT * FROM
+// pt_lifestyle_assessments` — every studio's rows, to any authenticated caller,
+// carrying smoking status, alcohol intake, stress and sleep scores and coach
+// notes. Passing another studio's client_id returned that client's history just
+// as readily, because nothing checked who owned it.
+//
+// The cause was the missing column rather than a forgotten line: 084 and 156
+// tenant-scoped weekly_checkins, strength_logs, progress_photos, mobility and
+// posture, and the two assessment tables they skipped are exactly the two that
+// leaked. There was nothing here to filter on. Migration 165 adds it.
 router.get('/lifestyle-assessments', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
   const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT * FROM pt_lifestyle_assessments ${whereSql} ORDER BY assessment_date DESC`, params
@@ -690,7 +705,7 @@ router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'tra
        smoking_status, cigarettes_per_day, years_smoking, alcohol_status, drinks_per_week,
        screen_time_bracket, travel_frequency, energy_level, motivation_to_exercise, recovery_quality, recovery_score,
        sedentary_risk, recovery_risk, habit_risk_score, risk_factors, lifestyle_score, lifestyle_readiness,
-       coach_notes, created_by
+       coach_notes, created_by, organization_id
      ) VALUES (
        $1,(SELECT COUNT(*)+1 FROM pt_lifestyle_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,$4,$5,$6,$7,$8,
@@ -703,7 +718,7 @@ router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'tra
        $25,$26,$27,$28,$29,
        $30,$31,$32,$33,$34,$35,
        $36,$37,$38,$39,$40,$41,
-       $42::jsonb,$43
+       $42::jsonb,$43,$44
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || null,
@@ -717,7 +732,10 @@ router.post('/lifestyle-assessments', auth, requireRole('admin', 'manager', 'tra
       b.smoking_status || null, b.cigarettes_per_day ?? null, b.years_smoking ?? null, b.alcohol_status || null, b.drinks_per_week ?? null,
       b.screen_time_bracket || null, b.travel_frequency || null, b.energy_level ?? null, b.motivation_to_exercise ?? null, b.recovery_quality || null, analysis.recoveryScore,
       analysis.sedentaryRisk, analysis.recoveryRisk, analysis.habitRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.lifestyleScore, analysis.lifestyleReadiness,
-      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id,
+      // Stamped, not inferred. An unstamped row is invisible to the studio that
+      // created it once the list route above filters on the column — the silent
+      // data loss 155_organization_id_not_null.sql exists to make impossible.
+      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
   );
   res.status(201).json({ data: rows[0] });
@@ -732,7 +750,18 @@ router.patch('/lifestyle-assessments/:id', auth, wrap(async (req, res) => {
     'screen_time_bracket', 'travel_frequency', 'energy_level', 'motivation_to_exercise', 'recovery_quality', 'coach_notes',
   ];
 
-  const { rows: existingRows } = await pool.query('SELECT * FROM pt_lifestyle_assessments WHERE id = $1', [req.params.id]);
+  // Tenant guard on the read AND on the write, not just the read. Re-checking
+  // in the UPDATE's own WHERE is what makes the handler safe under concurrency:
+  // the row's ownership cannot change between the two statements here, but the
+  // pattern is the one every other write in this file follows, and a guard that
+  // lives only in a preceding SELECT is the shape that quietly stops holding
+  // the first time somebody adds a transaction or reorders the function.
+  const scope = tenantScope(req);
+  const readGuard  = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const readParams = scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id];
+  const { rows: existingRows } = await pool.query(
+    `SELECT * FROM pt_lifestyle_assessments WHERE id = $1${readGuard}`, readParams
+  );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
@@ -777,7 +806,11 @@ router.patch('/lifestyle-assessments/:id', auth, wrap(async (req, res) => {
   }
 
   sets.push('updated_at = NOW()');
-  const { rows } = await pool.query(`UPDATE pt_lifestyle_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  let writeGuard = '';
+  if (scope.applyFilter) { params.push(scope.orgId); writeGuard = ` AND organization_id = $${params.length}`; }
+  const { rows } = await pool.query(
+    `UPDATE pt_lifestyle_assessments SET ${sets.join(', ')} WHERE id = $1${writeGuard} RETURNING *`, params
+  );
   res.json({ data: rows[0] });
 }));
 
@@ -885,10 +918,15 @@ async function computeNutritionAnalysis(clientId, b) {
   };
 }
 
+// Tenant-scoped. Same defect and same cause as the lifestyle list route above:
+// an optional client_id meant the bare request read every studio's rows, and
+// these carry food allergies, medical conditions and medical notes.
 router.get('/nutrition-assessments', auth, wrap(async (req, res) => {
   const { client_id } = req.query;
   const where = []; const params = [];
-  if (client_id) { params.push(client_id); where.push('client_id = $1'); }
+  const scope = tenantScope(req);
+  if (scope.applyFilter) { params.push(scope.orgId); where.push(`organization_id = $${params.length}`); }
+  if (client_id) { params.push(client_id); where.push(`client_id = $${params.length}`); }
   const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const { rows } = await pool.query(
     `SELECT * FROM pt_nutrition_assessments ${whereSql} ORDER BY assessment_date DESC`, params
@@ -916,7 +954,7 @@ router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'tra
        meal_preparer, nutrition_budget, medical_conditions, medical_notes,
        diet_quality_score, protein_score, protein_assessment, hydration_score, digestive_health_score,
        supplement_score, nutrition_risk_score, risk_factors, nutrition_score, nutrition_readiness,
-       coach_notes, created_by
+       coach_notes, created_by, organization_id
      ) VALUES (
        $1,(SELECT COUNT(*)+1 FROM pt_nutrition_assessments WHERE client_id = $1),COALESCE($2, CURRENT_DATE),
        $3,
@@ -931,7 +969,7 @@ router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'tra
        $30,$31,$32,$33,
        $34,$35,$36,$37,$38,
        $39,$40,$41,$42,$43,
-       $44::jsonb,$45
+       $44::jsonb,$45,$46
      ) RETURNING *`,
     [
       b.client_id, b.assessment_date || null,
@@ -950,7 +988,7 @@ router.post('/nutrition-assessments', auth, requireRole('admin', 'manager', 'tra
       b.meal_preparer || null, b.nutrition_budget || null, b.medical_conditions && b.medical_conditions.length ? b.medical_conditions : null, b.medical_notes || null,
       analysis.dietQualityScore, analysis.proteinScore, analysis.proteinAssessment, analysis.hydrationScore, analysis.digestiveHealthScore,
       analysis.supplementScore, analysis.nutritionRiskScore, analysis.riskFactors.length ? analysis.riskFactors : null, analysis.nutritionScore, analysis.nutritionReadiness,
-      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id,
+      b.coach_notes ? JSON.stringify(b.coach_notes) : null, req.user.id, orgIdOf(req),
     ]
   );
   res.status(201).json({ data: rows[0] });
@@ -971,7 +1009,13 @@ router.patch('/nutrition-assessments/:id', auth, wrap(async (req, res) => {
     'meal_preparer', 'nutrition_budget', 'medical_conditions', 'medical_notes', 'coach_notes',
   ];
 
-  const { rows: existingRows } = await pool.query('SELECT * FROM pt_nutrition_assessments WHERE id = $1', [req.params.id]);
+  // Tenant guard on read and write both — see the lifestyle PATCH above.
+  const scope = tenantScope(req);
+  const readGuard  = scope.applyFilter ? ' AND organization_id = $2' : '';
+  const readParams = scope.applyFilter ? [req.params.id, scope.orgId] : [req.params.id];
+  const { rows: existingRows } = await pool.query(
+    `SELECT * FROM pt_nutrition_assessments WHERE id = $1${readGuard}`, readParams
+  );
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: { code: 'NOT_FOUND' } });
 
@@ -1016,7 +1060,11 @@ router.patch('/nutrition-assessments/:id', auth, wrap(async (req, res) => {
   }
 
   sets.push('updated_at = NOW()');
-  const { rows } = await pool.query(`UPDATE pt_nutrition_assessments SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  let writeGuard = '';
+  if (scope.applyFilter) { params.push(scope.orgId); writeGuard = ` AND organization_id = $${params.length}`; }
+  const { rows } = await pool.query(
+    `UPDATE pt_nutrition_assessments SET ${sets.join(', ')} WHERE id = $1${writeGuard} RETURNING *`, params
+  );
   res.json({ data: rows[0] });
 }));
 

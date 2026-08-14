@@ -96,10 +96,25 @@ const REVIEWED_EXCEPTIONS = {
     'LEFT JOIN trainers ON t.id = cs.trainer_id — resolves a trainer name for ' +
     'a class row that the surrounding query has already scoped. The join is on ' +
     'a specific FK, not an open read of the trainers table.',
-  'routes/leave.js':
-    'Self-lookup (SELECT id FROM trainers WHERE id = $1 OR user_id = $1, keyed ' +
-    'on req.user.id) plus name-resolution joins on leave rows already scoped ' +
-    'to the caller.',
+  // routes/leave.js was here. The entry is REMOVED rather than reworded, and
+  // the removal is the point: the file now scopes properly, so it belongs under
+  // the assertion above like every other route.
+  //
+  // Worth recording why the entry was wrong, because it is the failure mode
+  // this list has and the reason entries must describe the whole file rather
+  // than the part that prompted them. It read: "Self-lookup (SELECT id FROM
+  // trainers WHERE id = $1 OR user_id = $1, keyed on req.user.id) plus
+  // name-resolution joins on leave rows already scoped to the caller."
+  //
+  // Both halves were true. "Already scoped to the caller" was true only for
+  // trainers — the list route pins trainer_id to the caller's own record. There
+  // was no such branch for admin or manager, so GET /api/leave returned every
+  // studio's leave with trainer name, email and phone, and approve/reject acted
+  // on any row on the platform by id. The exemption was written about the joins
+  // and silently covered the leak sitting beside them.
+  //
+  // An entry here must assert the FILE cannot leak, not that the construct that
+  // caught the author's eye is benign.
   'modules/bookings/bookings.service.js':
     'Name-resolution join only. Note this module targets the legacy ' +
     'members/member_memberships tables that server.js documents as abandoned.',
