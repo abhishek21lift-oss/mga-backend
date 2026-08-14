@@ -6,7 +6,7 @@ Progress of the PT-first → GMS-core transformation.
 route with a tenant test, a passing suite. Not on a plan, not on a document, not
 on a screen that renders. Every "Current" cell below cites what moved it.
 
-Last updated: after Phase 2a (per-studio settings and branches).
+Last updated: after Phase 3 (membership domain).
 
 ---
 
@@ -15,7 +15,7 @@ Last updated: after Phase 2a (per-studio settings and branches).
 | Domain | Before | **Current** | Target | Status |
 |---|---:|---:|---:|---|
 | Members | 0 | **70** | 100 | 🟢 ⬆️ **Moved twice** — end-to-end and tenant-tested. A gym owner can now register a member without touching PT |
-| Memberships | 0 | **0** | 100 | 🔴 Not started — Phase 3 |
+| Memberships | 0 | **55** | 100 | 🟡 ⬆️ **Moved** — full lifecycle + expiry sweep, tenant-tested. **No UI yet** |
 | Attendance | 70 | **70** | 100 | 🟡 Works, PT-bound. Phase 4 is cheaper than planned (see below) |
 | Billing | 60 | **60** | 100 | 🟡 Payment rails strong; no order layer |
 | POS | 0 | **0** | 100 | 🔴 Not started — Phase 6 |
@@ -137,9 +137,59 @@ It is the pre-multi-tenant flag table superseded by migration 123's feature
 manager, and both its endpoints have no caller. Tenanting a replaced table would
 be building on the thing being retired — classified DEPRECATE instead.
 
+### Phase 3 — the membership domain
+
+Migration 168 adds `membership_plans`, `memberships`, `membership_freezes` and
+`membership_events`, all org-scoped `NOT NULL` from birth with tenant-scoped
+uniques. `/api/membership-plans` and `/api/memberships` carry the lifecycle:
+sell, renew, freeze, resume, change plan, cancel. 39 new tests.
+
+**A gym membership is not a PT package**, which is why these are separate tables
+rather than a `kind` column: one grants building access and is consumed by time
+passing, the other grants sessions with a trainer and is consumed by a session
+being delivered. `pt_packages` is untouched.
+
+**`plans` is deliberately NOT migrated.** Phase 2a could fan `system_settings`
+out without a production count because those values were shared *by design*.
+`plans` is the opposite case — each row was created by one studio and nothing
+records which — so copying "Gold Annual, ₹25,000" into all six catalogues would
+preserve today's broken behaviour while making the leak permanent. The catalogue
+starts empty and each studio writes its own. V-03 is untouched and still gated on
+its count.
+
+**What the tests pin is arithmetic, not just tenancy.** A membership is dates and
+money, and each of these is wrong in a way that throws nothing:
+
+- a 30-day plan starting on the 1st ending on the 31st — twelve free days a year;
+- a renewal back-dated onto a lapsed term, selling days already gone;
+- a joining fee charged again on renewal;
+- a freeze closing without extending the term, so the member loses paid days;
+- a total taken from the request instead of computed, letting a caller set their
+  own price.
+
+**Why 55 and not higher:** no UI, so a gym owner still cannot sell a membership
+through the product; no payment linkage yet (Phase 5's order layer); and
+memberships do not appear in any report.
+
+### Notifications — reminders now actually fire
+
+`renewal.worker.js`'s expiry reminders are rewritten against the new domain, and
+a new nightly sweep marks lapsed memberships expired — ordered before the
+reminders, so a membership that ended weeks ago stops sitting in the active set.
+
+**Auto-renew is left disabled, explicitly.** The `memberships` table has no
+`auto_renew` flag because giving it one is a product decision, not a refactor:
+charging a stored card needs a mandate this product does not collect, and every
+payment path that works today is member-initiated. It now logs why instead of
+raising an exception that gets swallowed. The Razorpay order/capture handling and
+the `gateway_transactions` producer are kept for Phase 5.
+
+Class reminders are still broken (V-10) and belong to Phase 12.
+
 ### Also found, and it changes Phase 3
 
-**`renewal.worker.js` has never run.** Not "reads empty tables" — its SQL is
+**`renewal.worker.js` had never run.** *(Fixed in Phase 3 — see above.)* Not
+"reads empty tables" — its SQL was
 invalid against the schema. `member_memberships` has no `plan_id`; the legacy
 members table has neither `name` nor `deleted_at`; all three are selected or
 filtered on. Every statement raises at plan time, for every organization, on

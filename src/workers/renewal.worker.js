@@ -2,37 +2,46 @@
 // Membership maintenance: expiry reminders + auto-renew (charged via Razorpay)
 // + class reminders.
 //
-// ── STATUS: THIS WORKER DOES NOT RUN. Phase 3 owns rebuilding it. ───────────
+// ── STATUS after Phase 3 ────────────────────────────────────────────────────
 //
-// Its three `members` joins were repointed to `legacy_members_v3` by Phase 2,
-// because migration 166 renamed the abandoned v3 `members` table out of the way
-// and created a new canonical one in its place. Without the repoint these
-// queries would silently have started addressing the NEW table — a table with
-// different columns and no relationship to member_memberships — which is a
-// worse failure than the one described below, because it would look plausible.
+//   Expiry sweep      WORKS  — new, marks lapsed memberships expired
+//   Expiry reminders  WORKS  — rewritten against the Phase 3 membership domain
+//   Auto-renew        DISABLED, deliberately — see runAutoRenew()
+//   Class reminders   STILL BROKEN — Phase 12 owns it (V-10)
 //
-// The queries were already broken before that, and by more than empty tables.
-// Verified against Postgres 16 with the full migration chain applied:
+// ── Why the reminders had never fired ───────────────────────────────────────
+//
+// Not "the tables were empty". The SQL was invalid against the schema. Verified
+// against Postgres 16 with the full migration chain applied:
 //
 //     SELECT ... FROM member_memberships mm JOIN members m ...
 //                JOIN plans pl ON pl.id = mm.plan_id
 //     ERROR: column mm.plan_id does not exist
 //
-// `member_memberships` has no plan_id, and the legacy members table has neither
-// `name` nor `deleted_at` — both of which these queries select and filter on.
-// So every statement here raises at plan time, for every organization, on every
-// scheduled run. forEachOrganization() catches per-organization failures so one
-// studio's outage cannot stop the rest, and that is what has been swallowing it.
+// `member_memberships` has no plan_id, and the abandoned v3 members table has
+// neither `name` nor `deleted_at` — all three of which the query selected or
+// filtered on. So every statement raised at plan time, for every organization,
+// on every scheduled run, and forEachOrganization() catches per-organization
+// failures so one studio's outage cannot stop the rest. That is what had been
+// swallowing it.
 //
-// The consequence, stated plainly because it is easy to miss: NO membership
-// expiry reminder, renewal reminder or auto-renewal has ever been sent. The
-// notification infrastructure underneath is sound; its only caller cannot run.
+// Stated plainly because it is easy to miss: until this change, NO membership
+// expiry or renewal reminder had ever been sent. The notification infrastructure
+// underneath was sound; its only caller could not run.
 //
-// What is deliberately NOT changed here: the per-organization tenant handling.
-// runWithTenantContext plus an explicit organization_id filter in each query is
-// the correct pattern and the best example of it in the codebase — see the note
-// on forEachOrganization below. Phase 3 rewrites the SQL around it against the
-// new memberships domain; it does not touch the tenancy.
+// Phase 2 had repointed the three `members` joins at `legacy_members_v3`, since
+// migration 166 renamed the abandoned table and put a new canonical one in its
+// place — without that they would silently have started addressing the NEW
+// table, which is a worse failure because the queries would have looked
+// plausible. The reminder sweep now reads the real domain; the class-reminder
+// query still reads the legacy table and still cannot run, which is Phase 12's.
+//
+// ── What was NOT changed, on purpose ────────────────────────────────────────
+//
+// The per-organization tenant handling. runWithTenantContext plus an explicit
+// organization_id filter in every query is the correct pattern and the best
+// example of it in the codebase — see the note on forEachOrganization below.
+// Phase 3 rewrote the SQL around it and left the tenancy exactly as it was.
 //
 // Two modes:
 //
@@ -129,19 +138,43 @@ async function runReminders() {
   await forEachOrganization('reminders', (orgId) => remindersForOrg(orgId));
 }
 
+async function runExpiry() {
+  await forEachOrganization('expire-lapsed', (orgId) => expireLapsedForOrg(orgId));
+}
+
 async function remindersForOrg(orgId) {
   for (const days of REMINDER_DAYS) {
+    // Reads the Phase 3 membership domain (migration 168) joined to the Phase 2
+    // canonical member (migration 166).
+    //
+    // The query this replaced could not run at all. It read `member_memberships`
+    // joined to the abandoned v3 members table and to `plans` on `mm.plan_id` —
+    // and `member_memberships` has no plan_id, while that members table has
+    // neither `name` nor `deleted_at`, all three of which it selected or filtered
+    // on. Every statement raised at plan time, for every organization, on every
+    // scheduled run, and forEachOrganization's per-organization error handling
+    // swallowed it. So no expiry reminder had ever been sent.
+    //
+    // plan_name comes off the membership rather than the plan table: memberships
+    // snapshot what was sold precisely so a renamed or retired plan does not
+    // rewrite what the member is told they bought.
+    //
+    // Served by idx_memberships_expiry (organization_id, status, ends_on).
     const { rows } = await pool.query(`
-      SELECT m.id AS member_id, m.user_id, m.name, m.email, m.phone,
-             pl.name AS plan_name, mm.end_date,
-             (mm.end_date - CURRENT_DATE) AS days_remaining
-      FROM member_memberships mm
-      JOIN legacy_members_v3 m ON m.id = mm.member_id
-      JOIN plans pl ON pl.id = mm.plan_id
-      WHERE mm.status = 'active'
-        AND (mm.end_date - CURRENT_DATE) = $1
-        AND m.deleted_at IS NULL
-        AND mm.organization_id = $2
+      SELECT ms.id AS membership_id,
+             ms.member_id,
+             NULL::text AS user_id,
+             m.name, m.email, m.mobile AS phone,
+             ms.plan_name,
+             ms.ends_on,
+             (ms.ends_on - CURRENT_DATE) AS days_remaining
+        FROM memberships ms
+        JOIN members m ON m.id = ms.member_id
+       WHERE ms.status = 'active'
+         AND (ms.ends_on - CURRENT_DATE) = $1
+         AND ms.deleted_at IS NULL
+         AND m.deleted_at IS NULL
+         AND ms.organization_id = $2
     `, [days, orgId]);
 
     for (const m of rows) {
@@ -152,12 +185,79 @@ async function remindersForOrg(orgId) {
   }
 }
 
-async function runAutoRenew() {
-  if (!razorpay.isConfigured()) {
-    logger.warn('Razorpay not configured — skipping auto-renew. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to enable.');
-    return;
+/**
+ * Mark memberships whose term has passed as expired.
+ *
+ * Without this nothing ever leaves 'active', so the reminder sweep above keeps
+ * matching lapsed rows and the expiring-soon list grows forever. The routes read
+ * status directly, so a stale 'active' is also a member who still appears
+ * entitled to walk in.
+ *
+ * Deliberately does NOT touch 'frozen': a frozen membership's ends_on is pushed
+ * out on resume, so expiring it while suspended would take away time the member
+ * has paid for. That is the whole point of the freeze.
+ */
+async function expireLapsedForOrg(orgId) {
+  const { rows } = await pool.query(`
+    UPDATE memberships
+       SET status = 'expired', updated_at = NOW()
+     WHERE organization_id = $1
+       AND status = 'active'
+       AND ends_on < CURRENT_DATE
+       AND deleted_at IS NULL
+    RETURNING id, member_id, plan_name, ends_on
+  `, [orgId]);
+
+  for (const ms of rows) {
+    await pool.query(
+      `INSERT INTO membership_events
+         (organization_id, membership_id, kind, to_ends_on, effective_on, note)
+       VALUES ($1, $2, 'expired', $3, CURRENT_DATE, 'Expired by the nightly sweep')`,
+      [orgId, ms.id, ms.ends_on]
+    );
   }
-  await forEachOrganization('auto-renew', (orgId) => autoRenewForOrg(orgId));
+
+  if (rows.length) logger.info({ count: rows.length, orgId }, 'expired lapsed memberships');
+}
+
+/**
+ * Gateway auto-renewal. DISABLED, and left disabled deliberately — see below.
+ *
+ * Phase 3 rewrote the reminder sweep against the new membership domain because
+ * that was a broken thing with an obvious correct form. Auto-renew is not: the
+ * `memberships` table has no `auto_renew` flag, and the reason is that giving it
+ * one is a product decision rather than a refactor.
+ *
+ * Charging a stored card without the member initiating it needs a mandate the
+ * product does not currently collect, and every payment path that DOES work here
+ * is member-initiated: manual UPI with UTR verification, or a Razorpay checkout
+ * the member completes. Inventing an auto_renew column and silently charging
+ * against it would be the single most consequential thing to guess at in this
+ * whole transformation.
+ *
+ * So this returns immediately, and says why in the log rather than appearing to
+ * have run. The body below (autoRenewForOrg) is KEPT rather than deleted: its
+ * Razorpay order/capture handling and its gateway_transactions producer — the
+ * row the webhook resolves a tenant from, migration 164 — are the parts worth
+ * having when Phase 5 designs the billing model, and the comments in it record
+ * why each step is shaped the way it is.
+ *
+ * Note it could not have run before this change either: its SQL referenced
+ * mm.auto_renew, mm.plan_id, mm.trainer_id and mm.renewed_from_id, none of which
+ * exist on member_memberships. This makes the state explicit instead of relying
+ * on a raised exception being swallowed.
+ */
+async function runAutoRenew() {
+  logger.warn({ reason: 'no_mandate_model' },
+    'auto-renew is disabled: the membership domain has no auto_renew flag, and '
+    + 'charging without a member-initiated mandate is a Phase 5 billing decision. '
+    + 'Membership expiry reminders run normally.');
+}
+
+/** Kept for Phase 5. Not reachable — see runAutoRenew above. */
+// eslint-disable-next-line no-unused-vars
+async function autoRenewForOrgDisabled(orgId) {
+  return forEachOrganization('auto-renew', (o) => autoRenewForOrg(o));
 }
 
 async function autoRenewForOrg(orgId) {
@@ -284,6 +384,11 @@ async function classRemindersForOrg(orgId) {
 
 /** The full daily pass, shared by the one-shot script and the 'daily' job. */
 async function runDailyRenewalTasks() {
+  // Expiry BEFORE reminders, deliberately. Reminders match `status = 'active'`
+  // on an exact days-remaining value, so sweeping lapsed rows out first stops a
+  // membership that ended weeks ago from sitting in the active set — and stops
+  // the expiring-soon count growing forever.
+  await runExpiry();
   await runReminders();
   await runAutoRenew();
 }
@@ -411,6 +516,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  runReminders, runAutoRenew, runClassReminders, runDailyRenewalTasks,
+  runReminders, runExpiry, runAutoRenew, runClassReminders, runDailyRenewalTasks,
   createRenewalWorker, scheduleRenewalCron, processRenewalJob,
 };

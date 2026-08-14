@@ -259,10 +259,97 @@ const memberSchemas = {
   },
 };
 
+// Memberships (Phase 3). A period of gym access, priced by duration —
+// deliberately not planSchemas, whose `sessions_per_week` and PT/Membership
+// `kind` belong to the pre-multi-tenant catalogue this replaces.
+const money = z.number().nonnegative().optional();
+
+const membershipPlanSchemas = {
+  create: {
+    body: z.object({
+      name: z.string().min(1, 'Plan name is required').max(255).transform(function(v) { return v.trim(); }),
+      description: z.string().max(2000).optional().nullable(),
+      duration_days: z.number().int().positive('Duration must be at least one day'),
+      price: money,
+      joining_fee: money,
+      tax_pct: money,
+      is_active: z.boolean().optional(),
+      sort_order: z.number().int().optional(),
+    }),
+  },
+  update: {
+    body: z.object({
+      name: z.string().min(1).max(255).transform(function(v) { return v.trim(); }).optional(),
+      description: z.string().max(2000).optional().nullable(),
+      duration_days: z.number().int().positive().optional(),
+      price: money,
+      joining_fee: money,
+      tax_pct: money,
+      is_active: z.boolean().optional(),
+      sort_order: z.number().int().optional(),
+    }),
+  },
+};
+
+const membershipSchemas = {
+  create: {
+    body: z.object({
+      member_id: z.string().min(1),
+      plan_id: z.string().min(1),
+      starts_on: isoDate,
+      // Accepted so a studio can sell an odd-length term, but normally derived
+      // from the plan's duration_days.
+      ends_on: isoDate,
+      discount: money,
+      amount_paid: money,
+      // A joining fee is charged once. Renewals never include it; this lets the
+      // front desk waive it on a first sale too.
+      include_joining_fee: z.boolean().optional(),
+      status: z.enum(['pending', 'active']).optional(),
+      notes: z.string().max(2000).optional().nullable(),
+    }),
+  },
+  renew: {
+    body: z.object({
+      // Omitted renews onto the same plan.
+      plan_id: z.string().min(1).optional(),
+      starts_on: isoDate,
+      discount: money,
+      amount_paid: money,
+      notes: z.string().max(2000).optional().nullable(),
+    }),
+  },
+  freeze: {
+    body: z.object({
+      from_date: isoDate,
+      reason: z.string().max(500).optional().nullable(),
+    }),
+  },
+  resume: {
+    body: z.object({
+      to_date: isoDate,
+    }),
+  },
+  changePlan: {
+    body: z.object({
+      plan_id: z.string().min(1),
+      discount: money,
+      note: z.string().max(500).optional().nullable(),
+    }),
+  },
+  cancel: {
+    body: z.object({
+      reason: z.string().max(500).optional().nullable(),
+    }),
+  },
+};
+
 module.exports = {
   authSchemas,
   clientSchemas,
   memberSchemas,
+  membershipPlanSchemas,
+  membershipSchemas,
   paymentSchemas,
   planSchemas,
   trainerSchemas,

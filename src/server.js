@@ -529,6 +529,18 @@ app.use('/api/clients',           userApiLimiter, require('./routes/clients'));
 // path or its module reappear. Both remain true.
 app.use('/api/members',           userApiLimiter, require('./routes/members'));
 
+// Memberships (Phase 3) — a period of gym access, sold to a member.
+//
+// Distinct from PT packages, which grant sessions with a trainer and are
+// consumed by a session being delivered rather than by time passing. Both hang
+// off a member; a member may have either, both, or neither.
+//
+// NOT feature-gated. Members and memberships are core GMS: a studio that cannot
+// sell a membership is not running a gym management system, so unlike
+// 'packages' (PT) these have no gate() wrapper.
+app.use('/api/membership-plans',  userApiLimiter, require('./routes/membership-plans'));
+app.use('/api/memberships',       userApiLimiter, require('./routes/memberships'));
+
 app.use('/api/trainers',          require('./routes/trainers'));
 // Manual UTR verification payments. MUST be mounted before the finance ledger
 // router below: that one owns DELETE /:id and a bare /:id would otherwise

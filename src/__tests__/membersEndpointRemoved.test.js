@@ -109,8 +109,28 @@ describe('what was deliberately left alone', () => {
     const worker = fs.readFileSync(path.join(SRC, 'workers', 'renewal.worker.js'), 'utf8')
       .replace(/\/\*[\s\S]*?\*\//g, ' ')
       .replace(/^\s*\/\/[^\n]*$/gm, ' ');
+
+    // Still joins the abandoned table — the class-reminder query does, and
+    // Phase 12 owns rebuilding that one.
     expect(worker).toMatch(/JOIN legacy_members_v3\b/);
-    expect(worker).not.toMatch(/JOIN members\b/);
+
+    // The blanket "must not join `members`" assertion is GONE, and its removal
+    // is a correction rather than a relaxation.
+    //
+    // It was right while the worker only served the abandoned v3 stack: back
+    // then any `JOIN members` meant somebody had pointed a member_memberships
+    // query at the canonical table, which would have looked plausible while
+    // joining something unrelated.
+    //
+    // Phase 3 makes joining canonical `members` the CORRECT thing for the
+    // reminder sweep to do — it reads `memberships JOIN members`, which is the
+    // whole point of the rewrite. So the assertion is narrowed to the thing that
+    // is actually wrong: a `member_memberships` query must never resolve its
+    // member against the canonical table.
+    const memberMembershipsQueries = worker.match(/FROM member_memberships[\s\S]{0,400}?(?=`|\bWHERE\b)/gi) || [];
+    for (const q of memberMembershipsQueries) {
+      expect(q).not.toMatch(/JOIN members\b/);
+    }
   });
 });
 
