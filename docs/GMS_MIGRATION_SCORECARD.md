@@ -6,7 +6,7 @@ Progress of the PT-first → GMS-core transformation.
 route with a tenant test, a passing suite. Not on a plan, not on a document, not
 on a screen that renders. Every "Current" cell below cites what moved it.
 
-Last updated: after Phase 2 (canonical member domain).
+Last updated: after Phase 2b (member UI).
 
 ---
 
@@ -14,7 +14,7 @@ Last updated: after Phase 2 (canonical member domain).
 
 | Domain | Before | **Current** | Target | Status |
 |---|---:|---:|---:|---|
-| Members | 0 | **45** | 100 | 🟡 ⬆️ **Moved** — domain, API and tenant tests exist; **no UI yet** |
+| Members | 0 | **70** | 100 | 🟢 ⬆️ **Moved twice** — end-to-end and tenant-tested. A gym owner can now register a member without touching PT |
 | Memberships | 0 | **0** | 100 | 🔴 Not started — Phase 3 |
 | Attendance | 70 | **70** | 100 | 🟡 Works, PT-bound. Phase 4 is cheaper than planned (see below) |
 | Billing | 60 | **60** | 100 | 🟡 Payment rails strong; no order layer |
@@ -31,14 +31,17 @@ Last updated: after Phase 2 (canonical member domain).
 
 ---
 
-## Members — 0 → 45
+## Members — 0 → 45 (Phase 2) → 70 (Phase 2b)
 
-**Why 45 and not higher.** The rubric caps a domain at 60 until it is end-to-end,
-and there is **no member UI at all**. A gym owner still cannot register a member
-through the product. The API exists, is tenant-tested, and is mounted — that is
-worth real credit and not full marks.
+**Why 70 and not higher.** The domain is genuinely end-to-end: a gym owner can
+register a member, find them, edit them and remove them, with no PT screen
+involved. What is missing is everything that hangs off a member and does not
+exist yet — a member has no membership, no attendance of their own, no payment
+history and no locker, because those are Phases 3–10. Members also does not
+appear in any report. The rubric reserves 91+ for a domain that is reported on
+and RLS-backstopped, and V-16 is still open.
 
-Evidence:
+Evidence — backend (Phase 2):
 
 | Change | Detail |
 |---|---|
@@ -48,6 +51,28 @@ Evidence:
 | `/api/members` | List, get, create, update, soft-delete. Every query carries the organization predicate |
 | V-11 | Notification broadcast now resolves recipients inside the caller's organization |
 | Tests | 27 new, incl. the five-step IDOR matrix per verb and the three member-code defects |
+
+Evidence — frontend (Phase 2b), in `mga-frontend`:
+
+| Change | Detail |
+|---|---|
+| `/members` | Roster with server-side search and status filter, and a create dialog |
+| `/members/[id]` | Detail and edit, listing PT enrollments and linking out to the PT module rather than reimplementing it |
+| `api.members` | Five endpoints; api-shape snapshot updated with six purely additive lines |
+| Navigation | A **Members** group, placed above the PT client group and carrying no feature tag |
+| Tests | 11 new, pinning the domain distinction rather than the markup |
+
+Frontend: 1317 passing, typecheck clean, 0 lint errors, production build green.
+
+**The "no PT" state is the assertion worth knowing about.** A member with no
+personal training renders one plain sentence — not an EmptyState, not a call to
+action. Someone tidying that page could reasonably "improve" it into an empty
+state that wants filling, which silently restores the framing where PT is the
+default and its absence is a gap. A test fails if an `EmptyState` appears in
+that section.
+
+**Nothing else was added to the navigation.** Memberships, POS, Inventory, Staff
+and Lockers stay absent until their modules exist.
 
 **Verified against a real Postgres 16**, not by inspection: the full 185-migration
 chain was applied to an empty database, then re-run with seeded multi-studio data.
