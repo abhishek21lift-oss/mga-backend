@@ -6,7 +6,7 @@ Progress of the PT-first → GMS-core transformation.
 route with a tenant test, a passing suite. Not on a plan, not on a document, not
 on a screen that renders. Every "Current" cell below cites what moved it.
 
-Last updated: after Phase 3b (membership UI).
+Last updated: after Phase 4 (member check-in, front desk).
 
 ---
 
@@ -16,7 +16,7 @@ Last updated: after Phase 3b (membership UI).
 |---|---:|---:|---:|---|
 | Members | 0 | **70** | 100 | 🟢 ⬆️ **Moved twice** — end-to-end and tenant-tested. A gym owner can now register a member without touching PT |
 | Memberships | 0 | **72** | 100 | 🟢 ⬆️ **Moved twice** — a studio can sell, renew, freeze and cancel one end-to-end |
-| Attendance | 70 | **70** | 100 | 🟡 Works, PT-bound. Phase 4 is cheaper than planned (see below) |
+| Attendance | 70 | **82** | 100 | 🟢 ⬆️ **Moved** — a gym member can check in, and the desk sees their membership in the same response |
 | Billing | 60 | **60** | 100 | 🟡 Payment rails strong; no order layer |
 | POS | 0 | **0** | 100 | 🔴 Not started — Phase 6 |
 | Inventory | 0 | **0** | 100 | 🔴 Not started — Phase 7 |
@@ -186,7 +186,7 @@ green.
 **Why 72 and not higher:** no payment linkage yet — selling records
 `amount_paid` but does not create an invoice or a gateway payment, which is
 Phase 5's order layer; memberships do not appear in any report (Phase 13); and
-attendance still does not check a membership (Phase 4). 91+ also needs V-16.
+attendance did not check a membership — closed in Phase 4. 91+ also needs V-16.
 
 ### Notifications — reminders now actually fire
 
@@ -265,14 +265,88 @@ on hand-written predicates with no backstop.
 
 ---
 
+## Attendance — 70 → 82 (Phase 4)
+
+**Why 82 and not higher.** A member can now check in, be checked out, and be
+counted — end to end, with the front desk seeing their membership in the same
+response. What is missing keeps it under 91: members have no self-service
+check-in (the QR path still resolves through `pt_clients`), member attendance
+appears in no report, and the rubric reserves 91+ for a domain that is reported
+on and RLS-backstopped. V-16 is still open.
+
+**Why the domain was stuck at 70 and not lower.** Nothing about attendance was
+broken. `attendance_logs` has been tenant-scoped since 087, polymorphic since
+001, and the register, stats and gaps endpoints all worked. What was PT-bound
+was *who was allowed to appear in it*: the `ref_type` CHECK admitted `client`,
+`trainer`, `staff` and `user` — the four kinds of person a PT studio has. In a
+product whose central daily event is a member walking through the door, that
+event was not recordable. Not badly recorded — `INSERT` raised a check
+violation.
+
+Evidence — backend:
+
+| Change | Detail |
+|---|---|
+| Migration 169 | `'member'` added to the `ref_type` CHECK; `member_id` column; a CHECK that `member_id` and `ref_type` agree |
+| **Tenant FK** | `(member_id, organization_id)` → `members(id, organization_id)`, so a cross-tenant check-in is unrepresentable rather than merely refused |
+| `POST /check-in` | Returns the membership alongside the attendance row — one request, because two means the desk sees "checked in" before it sees "expired three weeks ago" |
+| `POST /check-out` | Closes today's visit; separate from check-in, because a toggle guesses wrong for the member who scans twice on the way in |
+| `memberInOrg` | Added to `lib/orgGuard.js` and applied on all three write paths, turning the FK's 23503 into the 404 the caller should get |
+| `today-summary` | Takes `?type=`, defaulting to `client` so every existing caller keeps the number it has today |
+| Tests | 18 new |
+
+Evidence — frontend, in `mga-frontend`:
+
+| Change | Detail |
+|---|---|
+| `/front-desk` | Search, check in, verdict. One screen, one job |
+| `api.attendance` | `checkIn`, `checkOut`, `todaySummary`; api-shape snapshot updated with three purely additive lines |
+| Navigation | **Front Desk** placed above All Members in the Members group — it is the screen that group is opened for most often |
+| Tests | 12 new, pinning the verdict rather than the markup |
+
+Frontend: 1355 passing, typecheck clean, 0 lint errors.
+
+**The composite foreign key is the part worth reading.** Verified against a real
+Postgres 16, a plain `REFERENCES members(id)` accepted studio B's member into
+studio A's `organization_id`. The row never leaks on read, because every SELECT
+carries the org predicate — studio A simply accumulates attendance for a person
+they have never met, and studio B's member count is quietly wrong.
+`routes/attendance.js` does guard this, but a guard in one file is a guard until
+someone adds a fourth write path, a bulk importer, or a worker. Over the pair,
+the invariant is the database's.
+
+**Check-in records and reports; it does not refuse.** An expired membership
+still returns 201, with `grants_entry: false`. Refusing would be the API
+deciding a studio's admission policy, and it would be wrong at the moment it
+mattered most — the member who paid cash ninety seconds ago, whose renewal is
+still being keyed in, is exactly who a hard block turns away. Both the backend
+test suite and the front-desk suite pin this, because "expired should be
+blocked" is a very reasonable thing for someone to think they are fixing.
+
+**A wrong claim caught before it shipped.** The first draft of migration 169
+also added RLS to `attendance_logs`, on the strength of a grep that found no
+migration naming the table beside a policy. That was wrong twice over: 131
+applies the full house pattern to it and 157 adds `tenant_isolation`, both
+discovering their tables at run time. It is the same dynamic-migration blind
+spot that cost the audit a wrong count of 90 tables against a true 77. A
+deny-all OR'd with `tenant_isolation` restricts nothing, while telling the next
+reader the table is deny-all when it is not — so the section now records why
+nothing is needed instead.
+
+---
+
 ## Findings that changed the plan
 
 Recorded because each moved a phase's cost or order.
 
-**Attendance decoupling is cheap.** `attendance_logs` is already polymorphic
-(`ref_id` + `ref_type CHECK IN ('client','trainer')`). Only the *resolution
-logic* in `qr-checkin.js` binds it to `pt_clients`. Phase 4 is a widened CHECK
-plus a lookup change — no table rewrite, no data migration.
+**Attendance decoupling is cheap** — confirmed, and it was even cheaper than
+predicted. `attendance_logs` is already polymorphic (`ref_id` + `ref_type`),
+already org-scoped, already branch-aware. Phase 4 shipped as a widened CHECK
+plus a foreign key: no table rewrite, no data migration, no backfill. The
+prediction was right about the mechanism and slightly wrong about the blocker —
+it is not `qr-checkin.js`'s resolution logic that bound attendance to PT, it is
+that the `ref_type` CHECK admitted only PT-shaped people, so a member check-in
+raised a constraint violation on **every** write path, not just the QR one.
 
 **V-05 is inert, not live.** The commission/payout module resolves trainers
 through `pt_trainers`, which migration 145 verified holds 0 rows and which
