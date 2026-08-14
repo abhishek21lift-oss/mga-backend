@@ -1,9 +1,31 @@
 // src/lib/fileStorage.js
-// Persists uploaded/generated files to Cloudflare R2 (S3-compatible object
-// storage) when R2 credentials are configured via env vars, falling back to
-// local disk otherwise. Render's filesystem is ephemeral — everything under
-// uploads/ is wiped on every deploy/restart — so production must use R2;
-// local dev keeps working unmodified without any Cloudflare account.
+// Persists uploaded/generated files to S3-compatible object storage when
+// credentials are configured via env vars, falling back to local disk
+// otherwise. Render's filesystem is ephemeral — everything under uploads/ is
+// wiped on every deploy/restart — so production must use object storage; local
+// dev keeps working unmodified with no storage account at all.
+//
+// ── Any S3-compatible provider, not only Cloudflare ─────────────────────────
+//
+// The endpoint used to be built from R2_ACCOUNT_ID alone:
+//
+//     endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`
+//
+// which hardcoded Cloudflare as the only possible provider. That is a real
+// constraint rather than a detail: server.js makes object storage a FATAL boot
+// requirement in production, so the choice of vendor was effectively mandatory
+// to run this software at all — and Cloudflare asks for a payment method even
+// on the free tier.
+//
+// R2_S3_ENDPOINT overrides it. Unset, everything behaves exactly as before and
+// no existing deployment changes. Set, it points at any S3-compatible service —
+// Supabase Storage, Backblaze B2, MinIO, AWS S3 itself — which matters most for
+// a deployment already using Supabase for its database, where storage comes
+// with the project it already has.
+//
+// The variables keep their R2_ names. Renaming them would break every existing
+// deployment for cosmetic gain, and the audit's own rule is that a rename is a
+// migration, not a tidy-up.
 const fs = require('fs');
 const path = require('path');
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
@@ -17,12 +39,37 @@ function isR2Configured() {
   return Boolean(process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY);
 }
 
+/**
+ * The S3 endpoint to talk to.
+ *
+ * R2_S3_ENDPOINT wins when set; otherwise the Cloudflare URL is derived from
+ * R2_ACCOUNT_ID exactly as before. A trailing slash is trimmed because the AWS
+ * SDK builds `${endpoint}/${bucket}/${key}` and a double slash is a different
+ * object key on some providers — a failure that shows up as a 404 on a file
+ * that was definitely uploaded.
+ */
+function s3Endpoint() {
+  const override = String(process.env.R2_S3_ENDPOINT || '').trim().replace(/\/+$/, '');
+  if (override) return override;
+  return `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+}
+
 let _s3Client = null;
 function getS3Client() {
   if (_s3Client) return _s3Client;
   _s3Client = new S3Client({
-    region: 'auto',
-    endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+    // 'auto' is Cloudflare's convention and is what every existing deployment
+    // uses. Other providers require their real region — Supabase and AWS both
+    // reject 'auto' with a SignatureDoesNotMatch, which is an unhelpful error
+    // for what is actually a configuration problem.
+    region: String(process.env.R2_REGION || '').trim() || 'auto',
+    endpoint: s3Endpoint(),
+    // Path-style addressing: `endpoint/bucket/key` rather than
+    // `bucket.endpoint/key`. R2 accepts both; Supabase, MinIO and most
+    // self-hosted gateways only accept path-style, and the SDK defaults to
+    // virtual-host style, so without this those providers fail DNS resolution
+    // on a hostname that was never going to exist.
+    forcePathStyle: true,
     credentials: {
       accessKeyId: process.env.R2_ACCESS_KEY_ID,
       secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
@@ -144,4 +191,11 @@ async function deleteFile(key) {
   storageLedger.recordDelete(key);
 }
 
-module.exports = { isR2Configured, saveFile, serveFile, getFileBuffer, deleteFile };
+module.exports = {
+  isR2Configured, saveFile, serveFile, getFileBuffer, deleteFile,
+  // Exported for the endpoint test only. The S3 client is memoised and built
+  // lazily on first upload, so there is no other way to assert which endpoint,
+  // region and addressing style a given set of env vars produces — and all
+  // three fail quietly enough that asserting them is worth one exported name.
+  _getS3ClientForTest: getS3Client,
+};
