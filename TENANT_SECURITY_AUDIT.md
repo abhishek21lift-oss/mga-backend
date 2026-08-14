@@ -28,8 +28,8 @@ mapped to the tables it queries and checked for a tenant predicate by reading th
 | Tables carrying `organization_id` | **67** |
 | Tables without it | **77** |
 | …of which genuinely tenant-owned and therefore **defective** | **21** |
-| Cross-tenant read paths, **live callers** | **13** (V-01 … V-10) |
-| Cross-tenant **write/delete** paths, **live callers** | **17** (V-03, V-04, V-06, V-07, V-08, V-09) |
+| Cross-tenant read paths, **live callers** | **13** at audit time — **8 remain** (V-01/02, V-09 fixed in P0; V-06 fixed in Phase 2a) |
+| Cross-tenant **write/delete** paths, **live callers** | **17** at audit time — **10 remain** (V-06's seven fixed in Phase 2a) |
 | Cross-tenant paths that are **latent** (inert today, live on a data or schema change) | **6** (V-05, V-11, V-12) |
 | Database-level backstop | **none** — API connects as `postgres` (`rolbypassrls = true`); 247 RLS policies, **0** organization-scoped |
 | `TENANT_RLS_ENFORCE` | **off** (commented out in `.env.example`) |
@@ -78,7 +78,7 @@ backlog:
 | `pt_plans` | PT plan catalogue | `POST /api/pt-os/clients` (lookup) | 🟠 High |
 | `pt_commissions` | Trainer commission ledger | `GET /api/pt-os/commissions`, `POST /commissions/calculate` | 🟠 High *(latent — V-05)* |
 | `pt_payouts` | Trainer payout ledger | `GET /api/pt-os/payouts`, `POST /payouts/mark-all-paid` | 🟠 High *(latent — V-05)* |
-| `system_settings` | **All studio configuration + branches + permissions** | `GET/PUT /api/settings/*` | 🔴 Critical |
+| ~~`system_settings`~~ | All studio configuration + branches + permissions | `GET/PUT /api/settings/*` | ✅ **Fixed — Phase 2a** (migration 167) |
 | `offers` | Promotions | `GET/POST/PUT/DELETE /api/offers` | 🔴 Critical |
 | `campaigns` | Marketing | `GET/POST/PUT/DELETE /api/campaigns` | 🔴 Critical |
 | `feedback` | Member feedback (**PII**) | `GET/PATCH /api/feedback` | 🔴 Critical |
@@ -89,7 +89,7 @@ backlog:
 | `bookings` | Class bookings | `/api/bookings`, `/api/v1/bookings` | 🟠 High |
 | `automation_rules` | Automation | `GET/POST/PUT/DELETE /api/automation/rules` | 🟠 High |
 | `session_balance` | PT session credits | `GET/POST /api/automation/session-balance` | 🟠 High |
-| `branches` | Branch directory (orphaned table) | none (dead) | 🔵 Low |
+| ~~`branches`~~ | Branch directory | `GET/POST/PUT/DELETE /api/settings/branches` | ✅ **Fixed — Phase 2a**; adopted as the real branch entity |
 | `qr_tokens` | Check-in tokens | `/api/qr/*` | 🟡 Medium |
 | `receipt_counter` | Receipt numbering | `src/db/receipts.js` | 🟡 Medium |
 
@@ -282,7 +282,28 @@ WHERE month = $1` should get its org predicate in P0-B regardless, because it co
 line and the blast radius if the analysis above is ever wrong is every studio's payout
 ledger.
 
-### V-06 🔴 `system_settings` is one global key/value table
+### V-06 ✅ RESOLVED (Phase 2a) — `system_settings` was one global key/value table
+
+> **Fixed by migration 167 and the rewrite of `routes/settings.js`.**
+> `organization_settings`, keyed `(organization_id, key)`, gives each studio its
+> own configuration; `branches` became a real tenant-owned table.
+>
+> The migration needed no production count, unlike the sixteen tables in §5, and
+> the difference is worth keeping: configuration keys were shared **by design**,
+> so every studio was already reading the same row — copying that value to each
+> studio changes nothing for anyone. Branches were the opposite and needed real
+> attribution, which they had: `POST /branches` has always stamped `updated_by`,
+> so the creating admin's organization owns the branch. One branch in the test
+> fixture had no creator and was **reported rather than guessed**.
+>
+> `system_settings` rows are left in place and simply no longer read, so the
+> change reverses by reverting code rather than restoring data. `internal_*` keys
+> stay there and stay operator-only.
+>
+> Covered by `settings.tenantIsolation.test.js` (19 tests) and the rewritten
+> `settings.branchDelete.test.js`. The original finding follows.
+
+### V-06 (original) 🔴 `system_settings` is one global key/value table
 
 `src/routes/settings.js`. There is exactly one row per key for the **entire platform**.
 
@@ -362,6 +383,34 @@ tenancy one.
 package called "Basic PT". A tenant-scoped `UNIQUE (organization_id, name)` is required.
 Same class of defect to check on every table that gains the column.
 
+### V-17 🔵 `feature_flags` is global — but the table is already superseded
+
+**Found during Phase 2a**, while tenanting the rest of `routes/settings.js`.
+
+`GET`/`PUT /api/settings/feature-flags` read and write `feature_flags`, which has
+no `organization_id`. An admin toggling a flag toggles it for every studio.
+
+Deliberately **not** fixed with the rest of V-06, and the reasoning is the point:
+
+- `feature_flags` is the pre-multi-tenant flag table. Migration 123 replaced it
+  with `platform_features` + `organization_features` + `plan_features`, resolved
+  per studio by `lib/features.js` — which is what `gate()` in `server.js` and the
+  whole Control Centre actually use.
+- **Both endpoints have no caller.** `settings.getFeatureFlags` and
+  `settings.updateFeatureFlags` are defined in the frontend's api barrel and
+  invoked from nowhere — the same shape as the dead `member.get` /
+  `member.metrics` that `MEMBERS-TENANT-GAP.md` found before `/api/v1/members`
+  was deleted.
+
+Adding `organization_id` to a table that has already been replaced would be
+building on the thing being retired. The real options are removal or migration
+onto the feature manager, both of which are legacy-cleanup decisions with their
+own evidence to gather. Classified **DEPRECATE** in
+`docs/LEGACY_SYSTEM_INVENTORY.md`.
+
+Severity is 🔵 rather than 🟠 because there is no caller and no live effect
+today. It is recorded so the absence is a decision rather than an oversight.
+
 ### V-16 🔵 No database backstop
 
 Recorded for completeness, from `db/migrations/TENANT-RLS-PLAN.md` (verified against
@@ -421,6 +470,7 @@ create `idx_<table>_organization_id`, then backfill.
 | `leave_requests` | `← trainers.organization_id` via `trainer_id` | Exact |
 | `class_sessions` | `← class_templates` once that is backfilled | Derived |
 | `plans`, `pt_plans`, `pt_packages`, `offers`, `campaigns`, `feedback`, `integrations`, `automation_rules`, `class_templates`, `bookings`, `qr_tokens`, `session_balance` | **No derivable owner.** Requires a read-only production count first | ⚠️ **See gate below** |
+| ~~`system_settings`~~, ~~`branches`~~ | Done in Phase 2a. Neither needed the gate: configuration was shared by design so fan-out was behaviour-preserving, and branches carried their creator in `updated_by` | ✅ |
 
 **Backfill gate — mandatory, and the reason this cannot be a blind migration.** For every
 table in the last row, run a read-only count against production *before* writing the
@@ -520,7 +570,7 @@ automatically by migration 157's dynamic discovery, which is why P0-A must come 
 | `ptPackages.tenantIsolation.test.js` | IDOR matrix incl. hard DELETE | V-04 |
 | `ptOs.markAllPaid.orgScope.test.js` | `mark-all-paid` blast radius (P0) | V-05 (partial) |
 | `ptOs.commissionsPayouts.tenantIsolation.test.js` | IDOR matrix — **deferred to Phase 8** | V-05 (full) |
-| `settings.tenantIsolation.test.js` | Settings/branches/permissions | V-06 |
+| ~~`settings.tenantIsolation.test.js`~~ | Settings/branches/permissions | ✅ V-06 — shipped, 19 tests |
 | `engagement.tenantIsolation.test.js` | offers/campaigns/feedback | V-07 |
 | `integrations.tenantIsolation.test.js` | IDOR matrix | V-08 |
 | `leave.tenantIsolation.test.js` | IDOR matrix | V-09 |

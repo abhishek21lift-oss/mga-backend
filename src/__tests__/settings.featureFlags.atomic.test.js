@@ -130,8 +130,16 @@ describe('the sibling handler it was made consistent with', () => {
       .put('/api/settings/permissions')
       .send({ perm_trainer_finance: true, perm_trainer_reports: false });
 
-    const writes = mockQueries.filter((q) => /INSERT INTO system_settings/i.test(q.sql));
+    // The table name moved, the assertion did not: migration 167 gave each
+    // studio its own settings (`organization_settings`, keyed by
+    // organization_id + key) because the old global table meant one studio's
+    // permission toggles applied to all six — V-06. This test is about the
+    // shape of the write, which is unchanged and still the thing worth
+    // guarding.
+    const writes = mockQueries.filter((q) => /INSERT INTO organization_settings/i.test(q.sql));
     expect(writes).toHaveLength(1);
     expect(writes[0].sql).toMatch(/unnest/i);
+    // And it is scoped, which the old form could not be.
+    expect(writes[0].sql).toMatch(/ON CONFLICT \(organization_id, key\)/);
   });
 });

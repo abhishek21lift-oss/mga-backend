@@ -6,7 +6,7 @@ Progress of the PT-first → GMS-core transformation.
 route with a tenant test, a passing suite. Not on a plan, not on a document, not
 on a screen that renders. Every "Current" cell below cites what moved it.
 
-Last updated: after Phase 2b (member UI).
+Last updated: after Phase 2a (per-studio settings and branches).
 
 ---
 
@@ -27,7 +27,7 @@ Last updated: after Phase 2b (member UI).
 | Classes | 10 | **10** | 100 | 🔴 Read-only stub, unscoped (V-10) |
 | Reports | 40 | **40** | 100 | 🟡 Real reports exist; 9 "All Reports" tabs are 503s |
 | PT OS | 78 | **78** | 100 | 🟢 Strongest area. Repositioning, not rebuilding |
-| **Tenant Security** | **Critical** | **🟠 High** | 100 | ⬆️ **Moved** — see below |
+| **Tenant Security** | **Critical** | **🟠 High** | 100 | ⬆️ **Moved twice** — V-06 closed in Phase 2a; 10 findings remain |
 
 ---
 
@@ -97,6 +97,46 @@ real data:
    and `(integer, integer)`. The namespace had to move into the hash seed. This
    would have raised 42883 on the first member ever created.
 
+### Phase 2a — V-06 closed
+
+`system_settings` was one global key/value table: all six studios shared one
+studio name, address, currency, timezone, check-in and geofence config, one set
+of role permissions, and one list of branches. `GET /api/settings` returned the
+platform's whole configuration to any authenticated user, and `DELETE
+/branches/:id` deleted somebody else's branch.
+
+Migration 167 adds `organization_settings` keyed `(organization_id, key)` and
+gives `branches` an `organization_id`, adopting the table that had sat orphaned
+since `schema.sql`. `routes/settings.js` is rewritten against both.
+
+**Neither half needed a production count**, and the reason is the distinction
+worth carrying into the remaining sixteen tables:
+
+- Configuration keys were shared **by design** — every studio already read the
+  same `currency` row — so giving each studio a copy of that value is exactly
+  behaviour-preserving. Verified on a seeded two-studio database, including that
+  a studio's own later edit survives a re-run.
+- Branches were the opposite, and carried their owner: `POST /branches` has
+  always stamped `updated_by`, so the creating admin's organization owns the
+  branch. In the test fixture two branches attributed correctly to two different
+  studios and a third with no creator was **reported, not guessed**.
+
+`system_settings` rows are left in place and simply no longer read, so this
+reverses by reverting code rather than restoring data.
+
+Two existing test files pinned behaviour that deliberately changed and were
+retargeted rather than relaxed. `settings.branchDelete.test.js` asserted a 409
+when a branch still had members — that count came `FROM clients`, the legacy
+table with 0 rows, so it could never fire; the delete is now soft, which removes
+the dangling-reference risk the 409 existed to prevent rather than merely
+dropping the check. The member-count guard returns against `members` when the
+member domain gains branch assignment.
+
+**V-17, new:** `feature_flags` is also global, and deliberately left that way.
+It is the pre-multi-tenant flag table superseded by migration 123's feature
+manager, and both its endpoints have no caller. Tenanting a replaced table would
+be building on the thing being retired — classified DEPRECATE instead.
+
 ### Also found, and it changes Phase 3
 
 **`renewal.worker.js` has never run.** Not "reads empty tables" — its SQL is
@@ -138,7 +178,6 @@ Open, and each is a live cross-tenant path with real callers:
 
 | Finding | Surface |
 |---|---|
-| **V-06** | `system_settings` is one global table — studio config, **branches**, **permissions** shared across all six studios |
 | **V-03** | `/api/plans` — read, update and soft-delete any studio's membership plans |
 | **V-04** | `/api/automation/pt-packages` — incl. a hard `DELETE` |
 | **V-07** | `/api/offers`, `/api/campaigns`, `/api/feedback` (member PII) |

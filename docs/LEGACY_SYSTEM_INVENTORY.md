@@ -106,8 +106,8 @@ its subscribers point at empty tables.
 | `/api/classes/sessions` | **REPLACE** | V-10. Read-only stub, unscoped, no management surface |
 | `/api/bookings` + `/api/v1/bookings` | **REPLACE** | Phase 12 |
 | `/api/clients` | **DEPRECATE** | Thin wrapper over `pt_clients`; superseded by `/api/members` + `/api/pt-os/enrollments` |
-| `/api/settings/branches` | **REPLACE** | V-06 — branches as `system_settings` keys. Phase 2a |
-| `branches` table (orphaned) | **KEEP** | Only referenced by a join in `google-calendar.js:182`. **Adopted** by Phase 2a rather than dropped — the table is the right shape, it was simply never used |
+| ~~`/api/settings/branches`~~ | **REPLACED — done (Phase 2a)** | Now serves the real `branches` table, org-scoped, with soft delete |
+| ~~`branches` table (orphaned)~~ | **ADOPTED — done (Phase 2a)** | Migration 167 gave it `organization_id`, `deleted_at` and a tenant-scoped unique name, and `routes/settings.js` now reads and writes it. The `branch_*` keys were migrated out of `system_settings`, attributed by their creator via `updated_by → users.organization_id`. The table was the right shape all along; it was simply never used |
 
 ---
 
@@ -121,6 +121,19 @@ its subscribers point at empty tables.
 | `pt_client_subscriptions.id` INTEGER vs TEXT elsewhere | **MIGRATE** | Called out as the outlier in `119_pt_leads.sql`'s own header |
 
 ---
+
+## 6b. Superseded flag table (found in Phase 2a)
+
+| Item | Class | Evidence |
+|---|---|---|
+| `feature_flags` table | **DEPRECATE** | The pre-multi-tenant flag table, replaced by migration 123's `platform_features` + `organization_features` + `plan_features`, which is what `gate()` in `server.js` and the Control Centre actually use. No `organization_id`, so an admin toggling a flag toggles it for every studio — recorded as **V-17** |
+| `GET`/`PUT /api/settings/feature-flags` | **DEPRECATE** | **No caller.** `settings.getFeatureFlags` and `settings.updateFeatureFlags` are defined in the frontend api barrel and invoked from nowhere — the same shape as the dead `member.get` / `member.metrics` that preceded the removal of `/api/v1/members` |
+
+Deliberately **not** tenant-scoped in Phase 2a: adding `organization_id` to a
+table that has already been replaced would be building on the thing being
+retired. Removal or migration onto the feature manager are the real options, and
+both need their own production evidence — so this is recorded as a decision
+rather than folded into the settings change.
 
 ## 7. KEEP — explicitly not legacy
 

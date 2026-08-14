@@ -1,34 +1,60 @@
 // DELETE /api/settings/branches/:id
 //
-// The Settings → Branches screen has always rendered a Delete button wired to
-// api.branches.delete(), but settings.js only registered GET/POST/PUT for
-// branches. The call 404'd, the catch showed "Failed to delete branch", and the
-// row stayed. Deleting a branch was simply not possible from the UI.
+// ── History, because this file's assertions were rewritten and the reason
+//    matters more than the assertions ─────────────────────────────────────────
 //
-// The interesting case is the refusal. Branches live in system_settings under a
-// `branch_<uuid>` key and clients.branch_id stores that full key — there is no
-// foreign key, so nothing cascades and nothing gets nulled. Deleting a branch
-// that still has members would leave those rows pointing at a key that no
-// longer resolves, and they would drop out of every per-branch view without a
-// word. So a populated branch is a 409, not a delete.
+// Originally: the Settings → Branches screen rendered a Delete button wired to
+// api.branches.delete(), but settings.js registered only GET/POST/PUT. The call
+// 404'd, the catch showed "Failed to delete branch", and the row stayed. This
+// file was written with the handler that fixed that.
+//
+// Its interesting case was a refusal. Branches lived in `system_settings` under
+// a `branch_<uuid>` key, `clients.branch_id` stored that full key, and there was
+// no foreign key — so nothing cascaded and nothing was nulled. A hard delete of
+// a populated branch left rows pointing at a key that no longer resolved, and
+// they dropped out of every per-branch view without a word. Hence 409 rather
+// than delete.
+//
+// Two things have since changed, and together they retire that guard rather
+// than merely remove it:
+//
+//  1. Migration 167 moved branches out of the global key/value table into the
+//     real `branches` table with an organization_id. That was V-06 in
+//     TENANT_SECURITY_AUDIT.md: every studio could see, edit and DELETE every
+//     other studio's branches. The old tests here asserted addressing by the
+//     bare settings key, which no longer exists as an addressing scheme.
+//
+//  2. The delete is now SOFT. A soft-deleted branch row still exists and still
+//     resolves — `branches.code` preserves the original `branch_<uuid>` key
+//     precisely so `users.branch_id` and any historical `clients.branch_id`
+//     keep resolving. So the dangling-reference failure the 409 existed to
+//     prevent cannot happen, which is a better answer than refusing the delete.
+//
+// The member-count refusal is therefore gone, and this is the honest reason it
+// is not simply reinstated: it counted `FROM clients WHERE branch_id = …`, and
+// `clients` is the legacy table with 0 rows that clients.legacy-table.test.js
+// now fails the build over. The count was structurally always zero, so the 409
+// could never fire in production — the old test proved the code path worked
+// against a mocked count, not that anything was ever protected. Neither
+// `members` nor `pt_clients` records a branch yet; when the member domain gains
+// branch assignment, the check comes back against `members` and belongs in this
+// file again.
+
 'use strict';
 
+const ORG_A = '11111111-1111-1111-1111-111111111111';
+const ORG_B = '22222222-2222-2222-2222-222222222222';
 const BRANCH_ID = '0b4d1f2e-1111-2222-3333-444455556666';
-const BRANCH_KEY = `branch_${BRANCH_ID}`;
 
-let mockBranchRows = [{ key: BRANCH_KEY }];
-let mockMemberCount = 0;
+let mockBranchRows;
 
 const mockQueries = [];
 jest.mock('../db/pool', () => ({
   query: jest.fn(async (sql, params) => {
     const text = String(sql).replace(/\s+/g, ' ').trim();
     mockQueries.push({ sql: text, params });
-    if (/^SELECT key FROM system_settings/i.test(text)) {
+    if (/branches/i.test(text)) {
       return { rows: mockBranchRows, rowCount: mockBranchRows.length };
-    }
-    if (/COUNT\(\*\)::int AS member_count/i.test(text)) {
-      return { rows: [{ member_count: mockMemberCount }], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
   }),
@@ -36,7 +62,7 @@ jest.mock('../db/pool', () => ({
 
 jest.mock('../lib/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 
-let mockUser = { id: 'admin-1', role: 'admin', organization_id: 'org-1' };
+let mockUser;
 jest.mock('../middleware/auth', () => ({
   auth: (req, _res, next) => { req.user = mockUser; next(); },
   adminOnly: (req, res, next) => (
@@ -59,58 +85,55 @@ function app() {
   return a;
 }
 
-const deleteQuery = () => mockQueries.find((q) => /^DELETE FROM system_settings/i.test(q.sql));
+const softDelete = () => mockQueries.find((q) => /UPDATE branches SET deleted_at/i.test(q.sql));
 
 beforeEach(() => {
   mockQueries.length = 0;
-  mockBranchRows = [{ key: BRANCH_KEY }];
-  mockMemberCount = 0;
-  mockUser = { id: 'admin-1', role: 'admin', organization_id: 'org-1' };
+  mockBranchRows = [{ id: BRANCH_ID }];
+  mockUser = { id: 'admin-1', role: 'admin', organization_id: ORG_A };
 });
 
 describe('DELETE /settings/branches/:id', () => {
-  test('deletes an empty branch and reports it', async () => {
+  test('deletes a branch and reports it', async () => {
     const res = await request(app()).delete(`/api/settings/branches/${BRANCH_ID}`);
 
     expect(res.status).toBe(200);
     // The client types this as { message: string } and shows it on success.
     expect(res.body).toEqual({ message: 'Branch deleted' });
-    expect(deleteQuery().params).toEqual([BRANCH_KEY]);
+    expect(softDelete()).toBeDefined();
   });
 
-  test('addresses the row by its prefixed settings key, not the bare id', async () => {
-    // clients.branch_id stores `branch_<uuid>`. Deleting on the bare uuid would
-    // match no row, and the member-count guard would check the wrong key.
+  test('is a soft delete, so nothing referencing the branch is left dangling', async () => {
+    // This is what replaced the member-count 409. See the note at the top.
     await request(app()).delete(`/api/settings/branches/${BRANCH_ID}`);
 
-    for (const q of mockQueries) {
-      expect(q.params).not.toContain(BRANCH_ID);
-      expect(q.params).toContain(BRANCH_KEY);
-    }
+    expect(softDelete().sql).toMatch(/SET deleted_at = NOW\(\)/i);
+    expect(mockQueries.some((q) => /DELETE FROM branches/i.test(q.sql))).toBe(false);
   });
 
-  test('refuses a branch that still has members, and does not delete', async () => {
-    mockMemberCount = 3;
-    const res = await request(app()).delete(`/api/settings/branches/${BRANCH_ID}`);
-
-    expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/3 members/);
-    expect(deleteQuery()).toBeUndefined();
-  });
-
-  test('the refusal reads naturally for a single member', async () => {
-    mockMemberCount = 1;
-    const res = await request(app()).delete(`/api/settings/branches/${BRANCH_ID}`);
-
-    expect(res.body.error).toMatch(/1 member\b/);
-    expect(res.body.error).not.toMatch(/1 members/);
-  });
-
-  test('counts only live members — a soft-deleted client must not block', async () => {
+  test('addresses the row by its own id, scoped to the caller organization', async () => {
     await request(app()).delete(`/api/settings/branches/${BRANCH_ID}`);
 
-    const countQ = mockQueries.find((q) => /member_count/i.test(q.sql));
-    expect(countQ.sql).toMatch(/deleted_at IS NULL/i);
+    const q = softDelete();
+    expect(q.sql).toMatch(/WHERE id = \$1 AND organization_id = \$2/);
+    expect(q.params).toEqual([BRANCH_ID, ORG_A]);
+  });
+
+  test("does not delete another studio's branch", async () => {
+    // The defect this replaced: with branches in a global table and no
+    // predicate, this call removed a branch belonging to a different studio.
+    mockUser = { id: 'admin-2', role: 'admin', organization_id: ORG_B };
+    mockBranchRows = []; // the organization predicate matched nothing
+
+    const res = await request(app()).delete(`/api/settings/branches/${BRANCH_ID}`);
+
+    expect(res.status).toBe(404);
+    expect(softDelete().params).toEqual([BRANCH_ID, ORG_B]);
+  });
+
+  test('no longer touches the global system_settings table', async () => {
+    await request(app()).delete(`/api/settings/branches/${BRANCH_ID}`);
+    expect(mockQueries.some((q) => /system_settings/i.test(q.sql))).toBe(false);
   });
 
   test('404s an unknown branch instead of reporting a successful delete', async () => {
@@ -118,15 +141,23 @@ describe('DELETE /settings/branches/:id', () => {
     const res = await request(app()).delete(`/api/settings/branches/${BRANCH_ID}`);
 
     expect(res.status).toBe(404);
-    expect(deleteQuery()).toBeUndefined();
+    expect(res.body.error).toMatch(/not found/i);
+  });
+
+  test('refuses a caller with no studio rather than deleting globally', async () => {
+    mockUser = { id: 'sa-1', role: 'admin', organization_id: null };
+    const res = await request(app()).delete(`/api/settings/branches/${BRANCH_ID}`);
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('ORG_REQUIRED');
+    expect(softDelete()).toBeUndefined();
   });
 
   test('a non-admin cannot delete a branch', async () => {
-    // Matches POST/PUT on the same collection, which are both adminOnly.
-    mockUser = { id: 'mgr-1', role: 'manager', organization_id: 'org-1' };
+    mockUser = { id: 'r-1', role: 'reception', organization_id: ORG_A };
     const res = await request(app()).delete(`/api/settings/branches/${BRANCH_ID}`);
 
     expect(res.status).toBe(403);
-    expect(deleteQuery()).toBeUndefined();
+    expect(softDelete()).toBeUndefined();
   });
 });
