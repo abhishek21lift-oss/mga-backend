@@ -115,7 +115,7 @@ its subscribers point at empty tables.
 
 | Item | Class | Evidence |
 |---|---|---|
-| `pt_clients.dob`, `.joining_date`, `.pt_start_date`, `.pt_end_date` | **MIGRATE** | Declared `TEXT`, cast at query time (`NULLIF(pt_end_date,'')::DATE`). Convert to `DATE` |
+| ~~`pt_clients.dob`, `.joining_date`, `.pt_start_date`, `.pt_end_date`~~ | **KEEP — already done** | **Correction (Phase 2).** Listed here as TEXT needing conversion. They are already `DATE`: `033_schema_fixes.sql` converted them with `ALTER COLUMN dob TYPE DATE USING NULLIF(TRIM(dob), '')::DATE`. Verified against Postgres 16 with the full chain applied. What misled the original reading is leftover defensive casting in application code (`NULLIF(pt_end_date,'')::DATE` in `pt-os.service.js`), which is now redundant — that string handling is the debt, not the columns. **Phase 20 is smaller than stated** |
 | `pt_plans.name UNIQUE` | **MIGRATE** | V-15 — global uniqueness on a tenant table |
 | `trainer_name` / `client_name` / `plan_name` copies | **KEEP for now** | Denormalised across `pt_clients`, `pt_commissions`, `pt_payouts`, `pt_client_renewals`. Real debt, but rename-propagation is a product decision. Revisit after Phase 14 |
 | `pt_client_subscriptions.id` INTEGER vs TEXT elsewhere | **MIGRATE** | Called out as the outlier in `119_pt_leads.sql`'s own header |

@@ -416,6 +416,8 @@ regardless of what it delivers.
    keeps every column it has.
 7. **Working payment infrastructure is not replaced.** Razorpay, UPI, UTR,
    gateway idempotency, receipts and invoices keep their code paths.
-8. **Dates are `DATE`/`TIMESTAMPTZ`.** No new `TEXT` dates; existing ones
-   (`pt_clients.dob`, `pt_start_date`, `pt_end_date`) are converted in the
-   cleanup phase, not opportunistically.
+8. **Dates are `DATE`/`TIMESTAMPTZ`.** No new `TEXT` dates. The examples this
+   invariant originally cited — `pt_clients.dob`, `pt_start_date`, `pt_end_date`
+   — turned out to be `DATE` already, converted by `033_schema_fixes.sql`;
+   corrected in Phase 2 and in the legacy inventory. What remains is redundant
+   string-casting in application code, which is cleanup rather than migration.

@@ -279,18 +279,42 @@ async function processNotificationJob(job) {
 /**
  * Resolve a member into a recipient object with all contact info.
  */
-async function recipientFromMember(memberId) {
-  // Try the clients table first (619 ERP schema), fall back to members
-  for (const table of ['clients', 'members']) {
+// V-11 in TENANT_SECURITY_AUDIT.md.
+//
+// This resolved a recipient by id with no organization check, so
+// POST /api/v1/notifications/broadcast accepted another studio's member id and
+// would message that person on the caller's behalf. It was inert only because
+// both tables it read were empty — and Phase 2 ends that: `members` now holds
+// every studio's roster. The audit flagged this as must-fix BEFORE the member
+// domain landed, which is why it is in this commit rather than a later one.
+//
+// The table list is also updated. It used to try `clients` first and fall back
+// to `members`, both of which were the abandoned v3 tables: `clients` is empty
+// and guarded by clients.legacy-table.test.js, and `members` was renamed to
+// legacy_members_v3 by migration 166. The live person tables are now `members`
+// (canonical, migration 166) and `pt_clients` (PT enrollment), both org-scoped.
+//
+// @param {string} memberId
+// @param {string|null} orgId  the caller's organization. REQUIRED for anything
+//   originating in a request. Null is accepted only for platform-level senders
+//   that legitimately cross tenants (the renewal worker resolves per-org and
+//   passes its own orgId; super-admin announcements have no owning studio).
+async function recipientFromMember(memberId, orgId = null) {
+  for (const table of ['members', 'pt_clients']) {
+    const params = [memberId];
+    let orgFilter = '';
+    if (orgId) { params.push(orgId); orgFilter = ` AND c.organization_id = $${params.length}`; }
+
     try {
       const { rows } = await pool.query(
         `SELECT c.id AS member_id, c.name, c.email, c.mobile AS phone, NULL AS user_id
-         FROM ${table} c WHERE c.id = $1`,
-        [memberId]
+           FROM ${table} c
+          WHERE c.id = $1 AND c.deleted_at IS NULL${orgFilter}`,
+        params
       );
       if (rows.length > 0) return rows[0];
     } catch {
-      // table may not exist, try next
+      // table may not exist on a database behind on migrations — try the next.
     }
   }
   throw new Error('Recipient not found');

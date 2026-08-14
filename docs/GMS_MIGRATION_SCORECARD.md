@@ -6,7 +6,7 @@ Progress of the PT-first → GMS-core transformation.
 route with a tenant test, a passing suite. Not on a plan, not on a document, not
 on a screen that renders. Every "Current" cell below cites what moved it.
 
-Last updated: after Phase 0 (tenant security) and Phase 1 (target architecture).
+Last updated: after Phase 2 (canonical member domain).
 
 ---
 
@@ -14,7 +14,7 @@ Last updated: after Phase 0 (tenant security) and Phase 1 (target architecture).
 
 | Domain | Before | **Current** | Target | Status |
 |---|---:|---:|---:|---|
-| Members | 0 | **0** | 100 | 🔴 Not started — Phase 2 |
+| Members | 0 | **45** | 100 | 🟡 ⬆️ **Moved** — domain, API and tenant tests exist; **no UI yet** |
 | Memberships | 0 | **0** | 100 | 🔴 Not started — Phase 3 |
 | Attendance | 70 | **70** | 100 | 🟡 Works, PT-bound. Phase 4 is cheaper than planned (see below) |
 | Billing | 60 | **60** | 100 | 🟡 Payment rails strong; no order layer |
@@ -29,9 +29,62 @@ Last updated: after Phase 0 (tenant security) and Phase 1 (target architecture).
 | PT OS | 78 | **78** | 100 | 🟢 Strongest area. Repositioning, not rebuilding |
 | **Tenant Security** | **Critical** | **🟠 High** | 100 | ⬆️ **Moved** — see below |
 
-**No domain score has moved yet, and that is correct.** Phase 0 was security and
-Phase 1 was design; neither builds a GMS domain. Recording 0s here rather than
-partial credit for documents is the point of the scorecard.
+---
+
+## Members — 0 → 45
+
+**Why 45 and not higher.** The rubric caps a domain at 60 until it is end-to-end,
+and there is **no member UI at all**. A gym owner still cannot register a member
+through the product. The API exists, is tenant-tested, and is mounted — that is
+worth real credit and not full marks.
+
+Evidence:
+
+| Change | Detail |
+|---|---|
+| Migration 166 | Canonical `members`, org-scoped `NOT NULL` from birth, RLS deny-all, tenant-scoped unique indexes |
+| Legacy table | Abandoned v3 `members` **renamed** to `legacy_members_v3`, not dropped — the `membersEndpointRemoved` guard keeps its full force |
+| `pt_clients.member_id` | Added `ON DELETE RESTRICT`; every PT client backfilled to exactly one member |
+| `/api/members` | List, get, create, update, soft-delete. Every query carries the organization predicate |
+| V-11 | Notification broadcast now resolves recipients inside the caller's organization |
+| Tests | 27 new, incl. the five-step IDOR matrix per verb and the three member-code defects |
+
+**Verified against a real Postgres 16**, not by inspection: the full 185-migration
+chain was applied to an empty database, then re-run with seeded multi-studio data.
+That is what caught the three defects below.
+
+### What running it actually caught
+
+Each of these passes a source review and an empty-database run, and fails on
+real data:
+
+1. **`date ~ unknown` has no operator.** The backfill guarded `dob` and
+   `joining_date` with a `^\d{4}-\d{2}-\d{2}$` regex, on the belief they were
+   TEXT. They are `DATE` — `033_schema_fixes.sql` converted them long ago. The
+   migration survived a fresh-install run only because `pt_clients` was empty, so
+   PL/pgSQL never planned the loop body. **The first real row would have taken
+   the deploy down.**
+2. **Member codes numbered from 1, not MAX + 1.** Exactly the defect
+   `MEMBERS-TENANT-GAP.md` records about the deleted generator. Caught by seeding
+   a pre-existing member and re-running: the backfill collided with `M00001` on
+   `uq_members_org_code`.
+3. **`pg_advisory_xact_lock(bigint, integer)` does not exist.** Only `(bigint)`
+   and `(integer, integer)`. The namespace had to move into the hash seed. This
+   would have raised 42883 on the first member ever created.
+
+### Also found, and it changes Phase 3
+
+**`renewal.worker.js` has never run.** Not "reads empty tables" — its SQL is
+invalid against the schema. `member_memberships` has no `plan_id`; the legacy
+members table has neither `name` nor `deleted_at`; all three are selected or
+filtered on. Every statement raises at plan time, for every organization, on
+every scheduled run, and `forEachOrganization`'s per-organization error handling
+swallows it.
+
+So **no membership expiry reminder, renewal reminder or auto-renewal has ever
+been sent.** Phase 3 is a rewrite of those queries, not a repointing of table
+names. Its tenant handling — `runWithTenantContext` plus an explicit
+`organization_id` filter per query — is correct and stays.
 
 ---
 

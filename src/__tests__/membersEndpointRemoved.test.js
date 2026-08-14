@@ -86,10 +86,63 @@ describe('what was deliberately left alone', () => {
   });
 
   it('the table still has the consumers that kept it', () => {
-    // renewal.worker.js joins members three times, and member_memberships has
-    // a foreign key to it. Both are why the table stays even though the
-    // endpoint went.
-    const worker = fs.readFileSync(path.join(SRC, 'workers', 'renewal.worker.js'), 'utf8');
-    expect(worker).toMatch(/JOIN members\b/);
+    // renewal.worker.js joins the abandoned v3 members table three times, and
+    // member_memberships has a foreign key to it. Both are why the table stays
+    // even though the endpoint went.
+    //
+    // The assertion now names `legacy_members_v3`, because migration 166
+    // renamed that table. This is a retarget, not a relaxation, and the
+    // distinction matters: the guard still asserts the worker addresses the
+    // ABANDONED table and not the canonical one. If someone repoints these
+    // joins at the new `members`, this fails — which is the outcome worth
+    // catching, because those queries would then look plausible while joining
+    // a table that has no relationship to member_memberships at all.
+    //
+    // A rename rather than a drop was chosen precisely so the test above ("no
+    // migration drops or alters the members table") keeps its full force.
+    // Comments stripped before matching. The worker's header quotes the
+    // failing query verbatim to record what is broken about it, and that quote
+    // contains the literal being searched for — so matching the raw file makes
+    // documenting the problem indistinguishable from having it. The same
+    // reasoning oldBrandLeakage.test.js sets out for allowing brand names in
+    // comments: a check that punishes explanation gets the explanation deleted.
+    const worker = fs.readFileSync(path.join(SRC, 'workers', 'renewal.worker.js'), 'utf8')
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/^\s*\/\/[^\n]*$/gm, ' ');
+    expect(worker).toMatch(/JOIN legacy_members_v3\b/);
+    expect(worker).not.toMatch(/JOIN members\b/);
+  });
+});
+
+describe('the canonical member domain is a different thing entirely', () => {
+  // Phase 2 introduced /api/members on migration 166's table. The assertions
+  // above are about /api/v1/members on the abandoned one, and both must hold at
+  // once — so this pins the properties that make them different, rather than
+  // leaving a future reader to conclude the guard above was quietly defeated.
+  const members = fs.readFileSync(path.join(SRC, 'routes', 'members.js'), 'utf8');
+  const migration = fs.readFileSync(
+    path.join(SRC, 'db', 'migrations', '166_member_domain.sql'), 'utf8');
+
+  it('is mounted at /api/members, not the guarded v1 path', () => {
+    expect(server).toMatch(/app\.use\(\s*'\/api\/members'/);
+    expect(server).not.toMatch(/app\.use\(\s*['"`]\/api\/v1\/members/);
+  });
+
+  it('sits on a table that is org-scoped from birth', () => {
+    // The old table could not be tenanted at all — no organization_id, so
+    // migration 157's dynamic RLS discovery could never cover it. That was the
+    // whole reason the endpoint had to go.
+    expect(migration).toMatch(/organization_id\s+UUID\s+NOT NULL REFERENCES organizations\(id\)/);
+  });
+
+  it('scopes every route, which is what the old one did not', () => {
+    // list() had no org predicate for admin or manager: an admin of one studio
+    // calling GET /api/v1/members got every studio's rows.
+    expect(members).toContain('tenantScope');
+    expect(members).toContain('orgIdOf');
+    const handlers = members.match(/router\.(get|post|put|delete)\(/g) || [];
+    expect(handlers.length).toBeGreaterThanOrEqual(5);
+    // Every read and write goes through orgWhere() or stamps orgIdOf().
+    expect((members.match(/orgWhere\(req, \w+/g) || []).length).toBeGreaterThanOrEqual(5);
   });
 });

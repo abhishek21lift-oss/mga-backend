@@ -207,9 +207,62 @@ const trainerSchemas = {
   },
 };
 
+// Gym members (Phase 2). Deliberately NOT clientSchemas with fields removed:
+// a member is a person who belongs to the gym, and every PT-shaped field above
+// — trainer_id, package_type, base_amount, sessions_per_week — is exactly what
+// must not be required of one. See docs/GMS_TARGET_ARCHITECTURE.md §1.
+//
+// dob is a real date here rather than the free string clientSchemas accepts,
+// because members.dob is a DATE column from birth. pt_clients only takes a
+// string because it predates 033_schema_fixes.sql converting its own column.
+const memberStatuses = ['prospect', 'active', 'inactive', 'expired', 'cancelled'];
+const memberSources  = ['walk-in', 'lead', 'import', 'pt', 'portal', 'other'];
+const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Expected YYYY-MM-DD').optional().nullable()
+  .or(z.literal('').transform(function() { return undefined; }));
+
+const memberSchemas = {
+  create: {
+    body: z.object({
+      name: z.string().min(1, 'Name is required').max(255).transform(function(v) { return v.trim(); }),
+      mobile: mobileSchema,
+      email: emailOptional,
+      dob: isoDate,
+      gender: z.string().max(20).optional().nullable(),
+      address: z.string().max(500).optional().nullable(),
+      photo_url: z.string().max(1000).optional().nullable(),
+      emergency_contact: z.string().max(255).optional().nullable(),
+      emergency_phone: z.string().max(20).optional().nullable(),
+      status: z.enum(memberStatuses).optional(),
+      joined_on: isoDate,
+      source: z.enum(memberSources).optional(),
+      notes: z.string().max(5000).optional().nullable(),
+      // member_code is deliberately absent: it is allocated server-side per
+      // organization. Letting a caller choose it reintroduces the collision the
+      // generator exists to prevent.
+    }),
+  },
+  update: {
+    body: z.object({
+      name: z.string().min(1).max(255).transform(function(v) { return v.trim(); }).optional(),
+      mobile: mobileSchema,
+      email: emailOptional,
+      dob: isoDate,
+      gender: z.string().max(20).optional().nullable(),
+      address: z.string().max(500).optional().nullable(),
+      photo_url: z.string().max(1000).optional().nullable(),
+      emergency_contact: z.string().max(255).optional().nullable(),
+      emergency_phone: z.string().max(20).optional().nullable(),
+      status: z.enum(memberStatuses).optional(),
+      joined_on: isoDate,
+      notes: z.string().max(5000).optional().nullable(),
+    }),
+  },
+};
+
 module.exports = {
   authSchemas,
   clientSchemas,
+  memberSchemas,
   paymentSchemas,
   planSchemas,
   trainerSchemas,

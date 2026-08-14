@@ -518,6 +518,17 @@ app.use('/api/search',            require('./routes/search'));
 // mounted here starts reading that table again.
 app.use('/api/clients',           userApiLimiter, require('./routes/clients'));
 
+// GMS core (Phase 2). The gym member, as distinct from the PT client.
+//
+// Read the note further down about /api/v1/members before assuming this is
+// that endpoint returning. It is not: different path, different table, and
+// every query carries the organization predicate the old one lacked. The
+// removal note (db/migrations/MEMBERS-TENANT-GAP.md) asked that if a members
+// endpoint ever came back it must come back with a tenant boundary, and
+// src/__tests__/membersEndpointRemoved.test.js still fails the build if the v1
+// path or its module reappear. Both remain true.
+app.use('/api/members',           userApiLimiter, require('./routes/members'));
+
 app.use('/api/trainers',          require('./routes/trainers'));
 // Manual UTR verification payments. MUST be mounted before the finance ledger
 // router below: that one owns DELETE /:id and a bare /:id would otherwise

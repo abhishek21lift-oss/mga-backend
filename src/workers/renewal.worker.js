@@ -2,6 +2,38 @@
 // Membership maintenance: expiry reminders + auto-renew (charged via Razorpay)
 // + class reminders.
 //
+// ── STATUS: THIS WORKER DOES NOT RUN. Phase 3 owns rebuilding it. ───────────
+//
+// Its three `members` joins were repointed to `legacy_members_v3` by Phase 2,
+// because migration 166 renamed the abandoned v3 `members` table out of the way
+// and created a new canonical one in its place. Without the repoint these
+// queries would silently have started addressing the NEW table — a table with
+// different columns and no relationship to member_memberships — which is a
+// worse failure than the one described below, because it would look plausible.
+//
+// The queries were already broken before that, and by more than empty tables.
+// Verified against Postgres 16 with the full migration chain applied:
+//
+//     SELECT ... FROM member_memberships mm JOIN members m ...
+//                JOIN plans pl ON pl.id = mm.plan_id
+//     ERROR: column mm.plan_id does not exist
+//
+// `member_memberships` has no plan_id, and the legacy members table has neither
+// `name` nor `deleted_at` — both of which these queries select and filter on.
+// So every statement here raises at plan time, for every organization, on every
+// scheduled run. forEachOrganization() catches per-organization failures so one
+// studio's outage cannot stop the rest, and that is what has been swallowing it.
+//
+// The consequence, stated plainly because it is easy to miss: NO membership
+// expiry reminder, renewal reminder or auto-renewal has ever been sent. The
+// notification infrastructure underneath is sound; its only caller cannot run.
+//
+// What is deliberately NOT changed here: the per-organization tenant handling.
+// runWithTenantContext plus an explicit organization_id filter in each query is
+// the correct pattern and the best example of it in the codebase — see the note
+// on forEachOrganization below. Phase 3 rewrites the SQL around it against the
+// new memberships domain; it does not touch the tenancy.
+//
 // Two modes:
 //
 //   1. BullMQ worker (production): consumes the 'membership-renewals' queue.
@@ -104,7 +136,7 @@ async function remindersForOrg(orgId) {
              pl.name AS plan_name, mm.end_date,
              (mm.end_date - CURRENT_DATE) AS days_remaining
       FROM member_memberships mm
-      JOIN members m ON m.id = mm.member_id
+      JOIN legacy_members_v3 m ON m.id = mm.member_id
       JOIN plans pl ON pl.id = mm.plan_id
       WHERE mm.status = 'active'
         AND (mm.end_date - CURRENT_DATE) = $1
@@ -133,7 +165,7 @@ async function autoRenewForOrg(orgId) {
   const { rows } = await pool.query(`
     SELECT mm.*, m.name, m.email, m.phone, m.user_id, pl.name AS plan_name, pl.duration, pl.price
     FROM member_memberships mm
-    JOIN members m ON m.id = mm.member_id
+    JOIN legacy_members_v3 m ON m.id = mm.member_id
     JOIN plans pl ON pl.id = mm.plan_id
     WHERE mm.auto_renew = TRUE
       AND mm.status = 'active'
@@ -239,7 +271,7 @@ async function classRemindersForOrg(orgId) {
     FROM bookings b
     JOIN class_sessions cs ON cs.id = b.session_id
     JOIN class_templates ct ON ct.id = cs.template_id
-    JOIN members m ON m.id = b.member_id
+    JOIN legacy_members_v3 m ON m.id = b.member_id
     WHERE b.status = 'confirmed'
       AND cs.starts_at BETWEEN NOW() + INTERVAL '25 minutes' AND NOW() + INTERVAL '35 minutes'
       AND b.organization_id = $1
