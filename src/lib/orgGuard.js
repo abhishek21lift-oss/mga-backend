@@ -24,4 +24,25 @@ async function clientInOrg(req, clientId) {
   return rowCount > 0;
 }
 
-module.exports = { clientInOrg };
+// True when `memberId` belongs to the caller's org. Same contract as
+// clientInOrg above and for the same reason, against the members table that
+// migration 166 created.
+//
+// This is not a duplicate of clientInOrg with a different table name, and the
+// distinction is the whole point of the transformation: a PT client and a gym
+// member are different people in different tables, one of which may exist
+// without the other. Routing a member id through clientInOrg would look up a
+// members UUID in pt_clients, find nothing, and reject every legitimate
+// check-in — a guard that fails closed on valid input is still broken.
+async function memberInOrg(req, memberId) {
+  if (!memberId) return true;
+  const scope = tenantScope(req);
+  if (!scope.applyFilter) return true;
+  const { rowCount } = await pool.query(
+    'SELECT 1 FROM members WHERE id = $1 AND deleted_at IS NULL AND organization_id = $2',
+    [memberId, scope.orgId]
+  );
+  return rowCount > 0;
+}
+
+module.exports = { clientInOrg, memberInOrg };

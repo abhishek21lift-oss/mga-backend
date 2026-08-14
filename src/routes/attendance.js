@@ -15,6 +15,7 @@ const pool = require('../db/pool');
 const { auth } = require('../middleware/auth');
 const { requireStaff } = require('../middleware/rbac');
 const { tenantScope, orgIdOf } = require('../lib/tenant-db');
+const { memberInOrg } = require('../lib/orgGuard');
 
 // ── AUD-004 (P1): this is the studio's back office ──────────────────────────
 //
@@ -125,6 +126,17 @@ router.post('/', auth, async (req, res, next) => {
 
     const type = d.type || 'client';
 
+    // A member id from the request body is not evidence that the member is
+    // this studio's. Without this, an admin of studio A can post a check-in
+    // for studio B's member: the row lands in A's organization_id, so it never
+    // leaks on read, but it creates a row in A referencing a person A has
+    // nothing to do with — and the 404/201 difference answers "does this id
+    // exist" for anyone willing to guess. Same guard, same reasoning as
+    // clientInOrg on every other write path that takes an id from the caller.
+    if (type === 'member' && !(await memberInOrg(req, d.ref_id))) {
+      return res.status(404).json({ error: 'Member not found' });
+    }
+
     // RBAC: trainers can only mark attendance for their own clients (gym and PT)
     if (req.user.role === 'trainer') {
       if (type === 'client') {
@@ -151,8 +163,8 @@ router.post('/', auth, async (req, res, next) => {
     await pool.query(`
       INSERT INTO attendance_logs
         (id, ref_id, ref_type, ref_name, date, check_in_time, check_out_time,
-         status, notes, method, marked_by, organization_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         status, notes, method, marked_by, organization_id, member_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
       ON CONFLICT (ref_id, ref_type, date) DO UPDATE
         SET status=$8,
             check_in_time=COALESCE(attendance_logs.check_in_time, $6),
@@ -163,7 +175,11 @@ router.post('/', auth, async (req, res, next) => {
       [id, d.ref_id, type, d.ref_name || null,
        d.date, checkIn, checkOut,
        d.status || 'present', d.notes || null,
-       'manual', req.user.id, orgIdOf(req)]
+       'manual', req.user.id, orgIdOf(req),
+       // member_id carries the real foreign key; ref_id stays the polymorphic
+       // one. Migration 169 constrains the two to agree, so this must be NULL
+       // for every other ref_type rather than opportunistically populated.
+       type === 'member' ? d.ref_id : null]
     );
     res.status(201).json({ message: 'Attendance marked' });
   } catch (err) {
@@ -175,14 +191,31 @@ router.post('/', auth, async (req, res, next) => {
 router.get('/today-summary', auth, async (req, res, next) => {
   try {
     const params = [];
+
+    // `type` defaults to 'client', which is what this endpoint has always
+    // counted, so every existing caller — the PT dashboard tile, the mobile
+    // app — keeps the number it has today. A gym floor asks the same question
+    // about members and now gets it by asking, rather than by this endpoint
+    // quietly changing what it means underneath a screen nobody edited.
+    const summaryType = ['client', 'trainer', 'staff', 'user', 'member'].includes(req.query.type)
+      ? req.query.type
+      : 'client';
+
     let trainerFilter = '';
-    if (req.user.role === 'trainer' && req.user.trainer_id) {
+    // The trainer restriction is about PT clients by construction, so it only
+    // applies when that is what is being counted. Left on a member query it
+    // would filter members through a list of client ids and return zero for
+    // every trainer — a wrong answer that reads as an empty gym.
+    if (summaryType === 'client' && req.user.role === 'trainer' && req.user.trainer_id) {
       params.push(req.user.trainer_id);
       trainerFilter = 'AND a.ref_id IN (SELECT id FROM clients WHERE trainer_id = $' + params.length + ' UNION SELECT id FROM pt_clients WHERE trainer_id = $' + params.length + ') ';
     }
     const scope = tenantScope(req);
     let orgFilter = '';
     if (scope.applyFilter) { params.push(scope.orgId); orgFilter = 'AND a.organization_id = $' + params.length + ' '; }
+
+    params.push(summaryType);
+    const typeParam = '$' + params.length;
 
     const { rows } = await pool.query(`
       SELECT
@@ -191,10 +224,165 @@ router.get('/today-summary', auth, async (req, res, next) => {
         COUNT(*) FILTER (WHERE a.status='late')    AS late,
         COUNT(*)                                    AS total
       FROM attendance_logs a
-      WHERE a.date = CURRENT_DATE AND a.ref_type = 'client' ${trainerFilter}${orgFilter}`,
+      WHERE a.date = CURRENT_DATE AND a.ref_type = ${typeParam} ${trainerFilter}${orgFilter}`,
       params
     );
     res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/attendance/check-in — the front desk operation
+//
+// A gym's highest-volume event, and the reason Phase 4 exists. POST / can
+// record a member now that ref_type accepts one, but it is a register-editing
+// endpoint: it wants a date, a status and a check-in time, and it answers
+// "recorded". The person at the desk has a different question — someone is
+// standing in front of them and they need to know whether to let them in.
+//
+// So this returns the membership alongside the attendance row. One request,
+// because two would mean the desk sees "checked in" before it sees "expired
+// three weeks ago", and the useful moment has already passed.
+//
+// ── It records, and reports. It does not refuse ─────────────────────────────
+//
+// An expired or frozen membership still gets a 201 and still creates the row,
+// with `membership.grants_entry: false` saying so. Refusing here would be this
+// file deciding a studio's admission policy, and it would be wrong at the
+// moment it mattered most: someone who paid in cash ninety seconds ago, whose
+// renewal is still being keyed in, is exactly the person a hard block turns
+// away. The register should record what happened; whether to open the turnstile
+// belongs to the person who can see both the member and the screen.
+router.post('/check-in', auth, async (req, res, next) => {
+  try {
+    const memberId = String(req.body.member_id || '').trim();
+    if (!memberId) return res.status(400).json({ error: 'member_id is required' });
+
+    const method = ['manual', 'qr', 'face', 'biometric'].includes(req.body.method)
+      ? req.body.method
+      : 'manual';
+
+    if (!(await memberInOrg(req, memberId))) {
+      return res.status(404).json({ error: 'Member not found' });
+    }
+
+    const scope = tenantScope(req);
+    const orgId = orgIdOf(req);
+
+    // Read the member for the denormalised ref_name. The org predicate is
+    // repeated even though memberInOrg just passed: the two run as separate
+    // statements, and a guard that is not also a filter is one refactor away
+    // from being the only thing standing between the two.
+    const memberParams = [memberId];
+    let memberOrgFilter = '';
+    if (scope.applyFilter) { memberParams.push(scope.orgId); memberOrgFilter = ' AND organization_id = $2'; }
+    const { rows: memberRows } = await pool.query(
+      `SELECT id, name, member_code, status
+         FROM members
+        WHERE id = $1 AND deleted_at IS NULL${memberOrgFilter}`,
+      memberParams
+    );
+    const member = memberRows[0];
+    if (!member) return res.status(404).json({ error: 'Member not found' });
+
+    // The membership that decides entry today, and if there is none, the most
+    // recent one — because "expired on the 3rd" is a far more useful thing to
+    // put in front of the desk than "no membership", which is what a query
+    // restricted to today's window would have returned for a lapsed member.
+    //
+    // ORDER BY puts a currently-valid membership first regardless of dates, so
+    // the CASE decides relevance and ends_on only breaks ties within it.
+    const { rows: membershipRows } = await pool.query(
+      `SELECT id, plan_name, status, starts_on, ends_on,
+              (ends_on - CURRENT_DATE) AS days_remaining,
+              (status = 'active' AND CURRENT_DATE BETWEEN starts_on AND ends_on) AS grants_entry
+         FROM memberships
+        WHERE member_id = $1
+          AND organization_id = $2
+          AND deleted_at IS NULL
+        ORDER BY (status = 'active' AND CURRENT_DATE BETWEEN starts_on AND ends_on) DESC,
+                 ends_on DESC
+        LIMIT 1`,
+      [memberId, orgId]
+    );
+    const membership = membershipRows[0] || null;
+
+    // ON CONFLICT rather than an existence check: two turnstile scans a second
+    // apart are ordinary, and a read-then-write here would race into a
+    // duplicate-key error on the (ref_id, ref_type, date) constraint. A second
+    // scan on the same day keeps the original check-in time — the first one is
+    // when they arrived — and only moves check_out_time.
+    const id = randomUUID();
+    const { rows: logRows } = await pool.query(
+      `INSERT INTO attendance_logs
+         (id, ref_id, ref_type, ref_name, member_id, date, check_in_time,
+          status, method, marked_by, organization_id)
+       VALUES ($1,$2,'member',$3,$2,CURRENT_DATE,NOW(),'present',$4,$5,$6)
+       ON CONFLICT (ref_id, ref_type, date) DO UPDATE
+         SET check_in_time  = COALESCE(attendance_logs.check_in_time, EXCLUDED.check_in_time),
+             ref_name       = EXCLUDED.ref_name,
+             member_id      = EXCLUDED.member_id,
+             organization_id = COALESCE(attendance_logs.organization_id, EXCLUDED.organization_id)
+       RETURNING id, date, check_in_time, check_out_time, method,
+                 (xmax = 0) AS first_today`,
+      [id, memberId, member.name, method, req.user.id, orgId]
+    );
+
+    res.status(201).json({
+      data: {
+        attendance: logRows[0],
+        member: { id: member.id, name: member.name, member_code: member.member_code, status: member.status },
+        // null is a real answer, not a missing one: a member on a day pass, or
+        // one registered but not yet sold anything, has no membership and the
+        // desk needs to see that rather than an absent key.
+        membership: membership
+          ? {
+            id: membership.id,
+            plan_name: membership.plan_name,
+            status: membership.status,
+            ends_on: membership.ends_on,
+            days_remaining: membership.days_remaining,
+            grants_entry: membership.grants_entry,
+          }
+          : null,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/attendance/check-out — close out today's visit
+//
+// Separate from check-in rather than a toggle on it. A toggle has to guess
+// which one a scan meant, and it guesses wrong for the member who scans twice
+// on the way in; the trigger from 025_qr_checkin.sql then computes a duration
+// from a check-out that never happened.
+router.post('/check-out', auth, async (req, res, next) => {
+  try {
+    const memberId = String(req.body.member_id || '').trim();
+    if (!memberId) return res.status(400).json({ error: 'member_id is required' });
+    if (!(await memberInOrg(req, memberId))) {
+      return res.status(404).json({ error: 'Member not found' });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE attendance_logs
+          SET check_out_time = NOW()
+        WHERE member_id = $1
+          AND organization_id = $2
+          AND date = CURRENT_DATE
+          AND check_out_time IS NULL
+      RETURNING id, date, check_in_time, check_out_time, duration_minutes`,
+      [memberId, orgIdOf(req)]
+    );
+
+    // 404 rather than a silent success. "Not checked in today" and "already
+    // checked out" are both this response, and both mean the same thing to the
+    // desk: nothing here to close.
+    if (!rows[0]) return res.status(404).json({ error: 'No open check-in for today' });
+    res.json({ data: rows[0] });
   } catch (err) {
     next(err);
   }
@@ -302,6 +490,15 @@ router.post('/bulk', auth, async function(req, res, next) {
         const type = d.type || 'client';
         const id = randomUUID();
 
+        // Per-record rather than hoisted out of the loop: bulk marking is the
+        // register being filled in for a whole day, and one foreign id in a
+        // batch of two hundred should cost that one record, not the batch.
+        // The loop already reports per-index errors for exactly this reason.
+        if (type === 'member' && !(await memberInOrg(req, d.ref_id))) {
+          errors.push({ index: i, ref_id: d.ref_id, error: 'Member not found' });
+          continue;
+        }
+
         // RBAC: trainers scoped to own clients (gym and PT)
         if (req.user.role === 'trainer') {
           const { rows: own } = await pool.query(
@@ -322,15 +519,16 @@ router.post('/bulk', auth, async function(req, res, next) {
         await pool.query(`
           INSERT INTO attendance_logs
             (id, ref_id, ref_type, ref_name, date,
-             check_in_time, check_out_time, status, notes, method, marked_by, organization_id)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+             check_in_time, check_out_time, status, notes, method, marked_by, organization_id, member_id)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
           ON CONFLICT (ref_id, ref_type, date) DO UPDATE
             SET status=$8, notes=$9,
                 organization_id=COALESCE(attendance_logs.organization_id, $12)`,
           [id, d.ref_id, type, d.ref_name || null,
            d.date, bulkCheckIn, bulkCheckOut,
            d.status || 'present', d.notes || null,
-           'manual', req.user.id, bulkOrgId]
+           'manual', req.user.id, bulkOrgId,
+           type === 'member' ? d.ref_id : null]
         );
         results.push({ index: i, ref_id: d.ref_id, status: d.status });
       } catch (err) {
