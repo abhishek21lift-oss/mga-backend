@@ -6,7 +6,7 @@ Progress of the PT-first → GMS-core transformation.
 route with a tenant test, a passing suite. Not on a plan, not on a document, not
 on a screen that renders. Every "Current" cell below cites what moved it.
 
-Last updated: after Phase 3 (membership domain).
+Last updated: after Phase 3b (membership UI).
 
 ---
 
@@ -15,7 +15,7 @@ Last updated: after Phase 3 (membership domain).
 | Domain | Before | **Current** | Target | Status |
 |---|---:|---:|---:|---|
 | Members | 0 | **70** | 100 | 🟢 ⬆️ **Moved twice** — end-to-end and tenant-tested. A gym owner can now register a member without touching PT |
-| Memberships | 0 | **55** | 100 | 🟡 ⬆️ **Moved** — full lifecycle + expiry sweep, tenant-tested. **No UI yet** |
+| Memberships | 0 | **72** | 100 | 🟢 ⬆️ **Moved twice** — a studio can sell, renew, freeze and cancel one end-to-end |
 | Attendance | 70 | **70** | 100 | 🟡 Works, PT-bound. Phase 4 is cheaper than planned (see below) |
 | Billing | 60 | **60** | 100 | 🟡 Payment rails strong; no order layer |
 | POS | 0 | **0** | 100 | 🔴 Not started — Phase 6 |
@@ -167,9 +167,26 @@ money, and each of these is wrong in a way that throws nothing:
 - a total taken from the request instead of computed, letting a caller set their
   own price.
 
-**Why 55 and not higher:** no UI, so a gym owner still cannot sell a membership
-through the product; no payment linkage yet (Phase 5's order layer); and
-memberships do not appear in any report.
+### Phase 3b — the UI (0 → 55 → 72)
+
+Three surfaces in `mga-frontend`: a membership panel on the member's own page, an
+expiring-soon list, and the plan catalogue. 17 new tests, 1334 passing, build
+green.
+
+| Claim pinned by test | Why it needs pinning |
+|---|---|
+| Selling happens on the member page, not the list | You sell a membership *to someone*. From a list you would pick a member out of a dropdown first, which is backwards from a front desk |
+| The membership panel renders **above** personal training | A gym membership is what most members have; PT is the optional extra. Swapping them restores the PT-first framing |
+| The two empty states differ | PT's is understated — no trainer is a complete record. Membership's offers the plans — no membership means nothing has been sold |
+| The list opens on expiring-in-7-days | The question a front desk asks each morning. A full list buries it under last month's renewals |
+| The catalogue seeds nothing | Copying legacy `plans` rows would present another studio's pricing as this one's; inventing Basic/Premium/Gold is fabricated product data |
+| Current membership = latest `ends_on` | Renewing before expiry is normal, so a member can hold two non-expired memberships. `rows[0]` would show whichever the database returned |
+| Resume reports the days added back | The extension is the point of a freeze; leaving it to be spotted on the end date is how members end up arguing about lost days |
+
+**Why 72 and not higher:** no payment linkage yet — selling records
+`amount_paid` but does not create an invoice or a gateway payment, which is
+Phase 5's order layer; memberships do not appear in any report (Phase 13); and
+attendance still does not check a membership (Phase 4). 91+ also needs V-16.
 
 ### Notifications — reminders now actually fire
 
