@@ -16,7 +16,7 @@ router.get('/', auth, wrap(async (req, res) => {
   let memberId = req.query.member_id;
   if (req.user.role === 'member') memberId = req.user.member_id;
   if (!memberId) return res.json({ data: [] });
-  const data = await svc.listForMember(memberId, req.query);
+  const data = await svc.listForMember(memberId, req.query, ctx(req));
   res.json({ data });
 }));
 

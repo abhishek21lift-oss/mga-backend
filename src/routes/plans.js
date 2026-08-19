@@ -5,6 +5,7 @@ const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
 const { validate } = require('../middleware/validate');
 const { planSchemas } = require('../lib/validation');
+const { tenantScope } = require('../lib/tenant-db');
 
 // GET /api/plans
 router.get('/', auth, async (req, res, next) => {
@@ -15,6 +16,10 @@ router.get('/', auth, async (req, res, next) => {
     let p = 1;
     if (kind)              { conds.push(`kind = $${p++}`);       params.push(kind); }
     if (active !== undefined) { conds.push(`is_active = $${p++}`); params.push(active !== 'false'); }
+
+    const { applyFilter, orgId } = tenantScope(req);
+    params.push(applyFilter ? orgId : null);
+    conds.push(`($${p++}::uuid IS NULL OR organization_id = $${p - 1})`);
 
     const limit  = Math.min(parseInt(req.query.limit, 10) || 200, 500);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
@@ -38,6 +43,9 @@ router.post('/', auth, adminOnly, validate(planSchemas.create), async (req, res,
     // ── Validation ──────────────────────────────────────────────────────────
     if (!d.name?.trim())
       return res.status(400).json({ error: 'Plan name is required' });
+
+    const { orgId } = tenantScope(req);
+    if (!orgId) return res.status(400).json({ error: 'Select an organization (x-org-id) to create a plan for' });
 
     const base    = parseFloat(d.base_amount)   || 0;
     const disc    = parseFloat(d.discount)      || 0;
@@ -63,9 +71,9 @@ router.post('/', auth, adminOnly, validate(planSchemas.create), async (req, res,
       `INSERT INTO plans
          (id, kind, name, description, duration,
           base_amount, discount, final_amount, joining_fee, tax_pct,
-          sessions_per_week, features, popular, color, is_active)
+          sessions_per_week, features, popular, color, is_active, organization_id)
        VALUES
-         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
        RETURNING *`,
       [
         id,
@@ -79,6 +87,7 @@ router.post('/', auth, adminOnly, validate(planSchemas.create), async (req, res,
         Boolean(d.popular),
         d.color || 'violet',
         isActive,
+        orgId,
       ]
     );
     res.status(201).json({ message: 'Plan created', plan: rows[0] });
@@ -91,7 +100,11 @@ router.post('/', auth, adminOnly, validate(planSchemas.create), async (req, res,
 router.put('/:id', auth, adminOnly, validate(planSchemas.update), async (req, res, next) => {
   try {
     const d = req.body;
-    const { rows: ex } = await pool.query('SELECT * FROM plans WHERE id=$1', [req.params.id]);
+    const { applyFilter, orgId } = tenantScope(req);
+    const { rows: ex } = await pool.query(
+      'SELECT * FROM plans WHERE id=$1 AND ($2::uuid IS NULL OR organization_id = $2)',
+      [req.params.id, applyFilter ? orgId : null]
+    );
     if (!ex[0]) return res.status(404).json({ error: 'Plan not found' });
 
     // Safe numeric coerce: only override if the field is actually present
@@ -123,7 +136,7 @@ router.put('/:id', auth, adminOnly, validate(planSchemas.update), async (req, re
          sessions_per_week=$10, features=$11,
          popular=$12, color=$13, is_active=$14,
          updated_at=NOW()
-       WHERE id=$15 RETURNING *`,
+       WHERE id=$15 AND ($16::uuid IS NULL OR organization_id = $16) RETURNING *`,
       [
         d.kind        || ex[0].kind,
         (d.name       || ex[0].name).trim(),
@@ -136,6 +149,7 @@ router.put('/:id', auth, adminOnly, validate(planSchemas.update), async (req, re
         d.color || ex[0].color || 'violet',
         isActive,
         req.params.id,
+        applyFilter ? orgId : null,
       ]
     );
     res.json({ message: 'Plan updated', plan: rows[0] });
@@ -147,9 +161,10 @@ router.put('/:id', auth, adminOnly, validate(planSchemas.update), async (req, re
 // DELETE /api/plans/:id  (admin only) — soft delete
 router.delete('/:id', auth, adminOnly, async (req, res, next) => {
   try {
+    const { applyFilter, orgId } = tenantScope(req);
     const { rows } = await pool.query(
-      'UPDATE plans SET deleted_at=NOW() WHERE id=$1 AND deleted_at IS NULL RETURNING id',
-      [req.params.id]
+      'UPDATE plans SET deleted_at=NOW() WHERE id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id = $2) RETURNING id',
+      [req.params.id, applyFilter ? orgId : null]
     );
     if (!rows[0]) return res.status(404).json({ error: 'Plan not found' });
     res.json({ message: 'Plan deleted' });

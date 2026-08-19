@@ -2,9 +2,15 @@
 const express = require('express');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { tenantScope } = require('../lib/tenant-db');
 
 const router = express.Router();
 router.use(auth, adminOnly);
+
+function orgParam(req) {
+  const scope = tenantScope(req);
+  return scope.applyFilter ? scope.orgId : null;
+}
 
 // GET /api/feedback
 router.get('/', async (req, res, next) => {
@@ -14,7 +20,9 @@ router.get('/', async (req, res, next) => {
     const values = [];
     if (status) { conditions.push(`status = $${values.length + 1}`); values.push(status); }
     if (type)   { conditions.push(`type = $${values.length + 1}`);   values.push(type); }
-    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    values.push(orgParam(req));
+    conditions.push(`($${values.length}::uuid IS NULL OR organization_id = $${values.length})`);
+    const where = `WHERE ${conditions.join(' AND ')}`;
     values.push(Number(limit), Number(offset));
     const result = await pool.query(
       `SELECT id, rating, message, reply, status,
@@ -38,6 +46,7 @@ router.get('/', async (req, res, next) => {
 // GET /api/feedback/stats
 router.get('/stats', async (req, res, next) => {
   try {
+    const org = orgParam(req);
     const result = await pool.query(`
       SELECT
         COUNT(*)                                         AS total,
@@ -54,7 +63,8 @@ router.get('/stats', async (req, res, next) => {
           )
         END                                             AS nps
       FROM feedback
-    `);
+      WHERE $1::uuid IS NULL OR organization_id = $1
+    `, [org]);
     res.json(result.rows[0]);
   } catch (err) { next(err); }
 });
@@ -62,22 +72,28 @@ router.get('/stats', async (req, res, next) => {
 // GET /api/feedback/:id
 router.get('/:id', async (req, res, next) => {
   try {
-    const result = await pool.query('SELECT * FROM feedback WHERE id = $1', [req.params.id]);
+    const result = await pool.query(
+      'SELECT * FROM feedback WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2)',
+      [req.params.id, orgParam(req)]
+    );
     if (!result.rows.length) return res.status(404).json({ error: 'Feedback not found' });
     res.json(result.rows[0]);
   } catch (err) { next(err); }
 });
 
-// POST /api/feedback — submit feedback (no auth required for members)
+// POST /api/feedback — submit feedback. Despite the historical comment this
+// (like every route in this file) sits behind router.use(auth, adminOnly)
+// above, so it is stamped with the submitting admin's own org, consistent
+// with every other write in this file.
 router.post('/', async (req, res, next) => {
   try {
     const { member_id, member_name, type, rating, message } = req.body;
     if (!message) return res.status(400).json({ error: 'message is required' });
     const result = await pool.query(
-      `INSERT INTO feedback (member_id, member_name, type, rating, message)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO feedback (member_id, member_name, type, rating, message, organization_id)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [member_id || null, member_name || null, type || 'general', rating || null, message]
+      [member_id || null, member_name || null, type || 'general', rating || null, message, orgParam(req)]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) { next(err); }
@@ -91,9 +107,9 @@ router.post('/:id/reply', async (req, res, next) => {
     const result = await pool.query(
       `UPDATE feedback
        SET reply = $1, replied_at = NOW(), status = 'replied', updated_at = NOW()
-       WHERE id = $2
+       WHERE id = $2 AND ($3::uuid IS NULL OR organization_id = $3)
        RETURNING *`,
-      [reply, req.params.id]
+      [reply, req.params.id, orgParam(req)]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Feedback not found' });
     res.json({ message: 'Reply sent' });
@@ -104,8 +120,9 @@ router.post('/:id/reply', async (req, res, next) => {
 router.post('/:id/resolve', async (req, res, next) => {
   try {
     const result = await pool.query(
-      `UPDATE feedback SET status = 'resolved', updated_at = NOW() WHERE id = $1 RETURNING *`,
-      [req.params.id]
+      `UPDATE feedback SET status = 'resolved', updated_at = NOW()
+       WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2) RETURNING *`,
+      [req.params.id, orgParam(req)]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Feedback not found' });
     res.json({ message: 'Feedback resolved' });
@@ -115,7 +132,10 @@ router.post('/:id/resolve', async (req, res, next) => {
 // DELETE /api/feedback/:id
 router.delete('/:id', async (req, res, next) => {
   try {
-    const result = await pool.query('DELETE FROM feedback WHERE id = $1 RETURNING id', [req.params.id]);
+    const result = await pool.query(
+      'DELETE FROM feedback WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2) RETURNING id',
+      [req.params.id, orgParam(req)]
+    );
     if (!result.rows.length) return res.status(404).json({ error: 'Feedback not found' });
     res.json({ success: true });
   } catch (err) { next(err); }

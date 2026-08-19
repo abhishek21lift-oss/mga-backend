@@ -2,9 +2,19 @@
 const express = require('express');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { tenantScope } = require('../lib/tenant-db');
 
 const router = express.Router();
 router.use(auth, adminOnly);
+
+// Null-safe tenant param: a tenant admin's own org id (filters strictly); a
+// platform super admin operating platform-wide gets NULL, which the
+// `$x::uuid IS NULL OR organization_id = $x` clause below reads as "every
+// row" — same convention as routes/communication.js.
+function orgParam(req) {
+  const scope = tenantScope(req);
+  return scope.applyFilter ? scope.orgId : null;
+}
 
 // GET /api/offers
 router.get('/', async (req, res, next) => {
@@ -14,7 +24,9 @@ router.get('/', async (req, res, next) => {
     const values = [];
     if (status)   { conditions.push(`status = $${values.length + 1}`);   values.push(status); }
     if (audience) { conditions.push(`audience = $${values.length + 1}`); values.push(audience); }
-    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    values.push(orgParam(req));
+    conditions.push(`($${values.length}::uuid IS NULL OR organization_id = $${values.length})`);
+    const where = `WHERE ${conditions.join(' AND ')}`;
     const result = await pool.query(
       `SELECT id, code, status,
               title          AS name,
@@ -36,6 +48,7 @@ router.get('/', async (req, res, next) => {
 // GET /api/offers/stats
 router.get('/stats', async (req, res, next) => {
   try {
+    const org = orgParam(req);
     const result = await pool.query(`
       SELECT
         COUNT(*)                                           AS total,
@@ -43,7 +56,8 @@ router.get('/stats', async (req, res, next) => {
         COUNT(*) FILTER (WHERE status = 'expired')        AS expired,
         COALESCE(SUM(used_count), 0)                      AS total_used
       FROM offers
-    `);
+      WHERE $1::uuid IS NULL OR organization_id = $1
+    `, [org]);
     res.json(result.rows[0]);
   } catch (err) { next(err); }
 });
@@ -51,7 +65,10 @@ router.get('/stats', async (req, res, next) => {
 // GET /api/offers/:id
 router.get('/:id', async (req, res, next) => {
   try {
-    const result = await pool.query('SELECT * FROM offers WHERE id = $1', [req.params.id]);
+    const result = await pool.query(
+      'SELECT * FROM offers WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2)',
+      [req.params.id, orgParam(req)]
+    );
     if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
     res.json(result.rows[0]);
   } catch (err) { next(err); }
@@ -64,8 +81,8 @@ router.post('/', async (req, res, next) => {
     if (!title) return res.status(400).json({ error: 'title is required' });
     const result = await pool.query(
       `INSERT INTO offers
-         (title, description, discount_type, discount_value, code, audience, max_uses, valid_from, valid_until, status, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         (title, description, discount_type, discount_value, code, audience, max_uses, valid_from, valid_until, status, created_by, organization_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING *`,
       [
         title,
@@ -79,6 +96,7 @@ router.post('/', async (req, res, next) => {
         valid_until || null,
         status || 'active',
         req.user?.id,
+        orgParam(req),
       ]
     );
     res.status(201).json({ offer: result.rows[0] });
@@ -105,9 +123,9 @@ router.put('/:id', async (req, res, next) => {
            valid_until    = $9,
            status         = COALESCE($10, status),
            updated_at     = NOW()
-       WHERE id = $11
+       WHERE id = $11 AND ($12::uuid IS NULL OR organization_id = $12)
        RETURNING *`,
-      [title, description, discount_type, discount_value, code, audience, max_uses || null, valid_from || null, valid_until || null, status, req.params.id]
+      [title, description, discount_type, discount_value, code, audience, max_uses || null, valid_from || null, valid_until || null, status, req.params.id, orgParam(req)]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
     res.json({ offer: result.rows[0] });
@@ -120,7 +138,10 @@ router.put('/:id', async (req, res, next) => {
 // DELETE /api/offers/:id
 router.delete('/:id', async (req, res, next) => {
   try {
-    const result = await pool.query('DELETE FROM offers WHERE id = $1 RETURNING id', [req.params.id]);
+    const result = await pool.query(
+      'DELETE FROM offers WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2) RETURNING id',
+      [req.params.id, orgParam(req)]
+    );
     if (!result.rows.length) return res.status(404).json({ error: 'Offer not found' });
     res.json({ message: 'Offer deleted' });
   } catch (err) { next(err); }
@@ -133,11 +154,12 @@ router.post('/:id/redeem', async (req, res, next) => {
       `UPDATE offers
        SET used_count = used_count + 1, updated_at = NOW()
        WHERE id = $1
+         AND ($2::uuid IS NULL OR organization_id = $2)
          AND status = 'active'
          AND (max_uses IS NULL OR used_count < max_uses)
          AND (valid_until IS NULL OR valid_until >= CURRENT_DATE)
        RETURNING *`,
-      [req.params.id]
+      [req.params.id, orgParam(req)]
     );
     if (!result.rows.length) return res.status(400).json({ error: 'Offer is not redeemable' });
     res.json({ success: true, offer: result.rows[0] });

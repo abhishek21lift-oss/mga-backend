@@ -59,12 +59,18 @@ async function book({ session_id, member_id }, ctx) {
 
     // 1. Lock the session row to serialize concurrent bookers
     const sessionRes = await client.query(
-      `SELECT id, capacity, starts_at, status, template_id
+      `SELECT id, capacity, starts_at, status, template_id, organization_id
        FROM class_sessions WHERE id = $1 FOR UPDATE`,
       [session_id]
     );
     if (sessionRes.rows.length === 0) throw new HttpError(404, 'NOT_FOUND', 'Class session not found');
     const session = sessionRes.rows[0];
+    // A tenant caller (anyone but a platform super admin) may only book a
+    // session belonging to their own org — otherwise session_id alone would
+    // let any studio's member book into any other studio's class.
+    if (ctx.role !== 'super_admin' && session.organization_id !== ctx.organization_id) {
+      throw new HttpError(404, 'NOT_FOUND', 'Class session not found');
+    }
     if (session.status !== 'scheduled') throw new HttpError(400, 'BAD_STATE', 'Session is not scheduled');
     if (new Date(session.starts_at) < new Date()) throw new HttpError(400, 'BAD_STATE', 'Session already started');
 
@@ -171,7 +177,7 @@ async function cancel(bookingId, { reason } = {}, ctx) {
     await client.query('BEGIN');
 
     const r = await client.query(
-      `SELECT b.*, cs.starts_at, cs.capacity, mm.plan_id, p.included_classes
+      `SELECT b.*, cs.starts_at, cs.capacity, cs.organization_id AS session_org_id, mm.plan_id, p.included_classes
        FROM bookings b
        JOIN class_sessions cs ON cs.id = b.session_id
        LEFT JOIN member_memberships mm ON mm.id = b.membership_id
@@ -185,6 +191,9 @@ async function cancel(bookingId, { reason } = {}, ctx) {
     // Authorization
     if (ctx.role === 'member' && b.member_id !== ctx.member_id) {
       throw new HttpError(403, 'FORBIDDEN', 'Not your booking');
+    }
+    if (ctx.role !== 'super_admin' && b.session_org_id !== ctx.organization_id) {
+      throw new HttpError(404, 'NOT_FOUND', 'Booking not found');
     }
     if (b.status === 'cancelled') throw new HttpError(400, 'ALREADY_CANCELLED', 'Already cancelled');
 
@@ -280,12 +289,20 @@ async function checkIn(bookingId, { method = 'manual' }, _ctx) {
   return b;
 }
 
-async function listForMember(memberId, { from, to, status } = {}) {
+async function listForMember(memberId, { from, to, status } = {}, ctx = {}) {
   const params = [memberId];
   const where = [`b.member_id = $1`];
   if (from)   { params.push(from);   where.push(`cs.starts_at >= $${params.length}`); }
   if (to)     { params.push(to);     where.push(`cs.starts_at <= $${params.length}`); }
   if (status) { params.push(status); where.push(`b.status = $${params.length}`); }
+  // Without this, any authenticated caller other than a 'member' could pass
+  // an arbitrary member_id query param (bookings.routes.js only substitutes
+  // the caller's own member_id for role === 'member') and read another
+  // studio's bookings. Null-safe so a platform super admin still sees all.
+  if (ctx.role !== 'super_admin') {
+    params.push(ctx.organization_id || null);
+    where.push(`($${params.length}::uuid IS NOT NULL AND cs.organization_id = $${params.length})`);
+  }
 
   const { rows } = await pool.query(
     `SELECT b.id, b.status, b.position, b.booked_at, b.checked_in_at,
