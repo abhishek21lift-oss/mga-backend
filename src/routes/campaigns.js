@@ -2,9 +2,15 @@
 const express = require('express');
 const pool = require('../db/pool');
 const { auth, adminOnly } = require('../middleware/auth');
+const { tenantScope } = require('../lib/tenant-db');
 
 const router = express.Router();
 router.use(auth, adminOnly);
+
+function orgParam(req) {
+  const scope = tenantScope(req);
+  return scope.applyFilter ? scope.orgId : null;
+}
 
 // GET /api/campaigns
 router.get('/', async (req, res, next) => {
@@ -14,7 +20,9 @@ router.get('/', async (req, res, next) => {
     const values = [];
     if (status) { conditions.push(`status = $${values.length + 1}`); values.push(status); }
     if (type)   { conditions.push(`type = $${values.length + 1}`);   values.push(type); }
-    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    values.push(orgParam(req));
+    conditions.push(`($${values.length}::uuid IS NULL OR organization_id = $${values.length})`);
+    const where = `WHERE ${conditions.join(' AND ')}`;
     const result = await pool.query(
       `SELECT id, name, status, audience,
               type            AS channel,
@@ -35,6 +43,7 @@ router.get('/', async (req, res, next) => {
 // GET /api/campaigns/stats
 router.get('/stats', async (req, res, next) => {
   try {
+    const org = orgParam(req);
     const result = await pool.query(`
       SELECT
         COUNT(*) FILTER (WHERE status = 'active')        AS active,
@@ -44,7 +53,8 @@ router.get('/stats', async (req, res, next) => {
           ELSE ROUND(SUM(conversions)::NUMERIC / SUM(sent_count) * 100, 1)
         END                                               AS conv_rate
       FROM campaigns
-    `);
+      WHERE $1::uuid IS NULL OR organization_id = $1
+    `, [org]);
     res.json(result.rows[0]);
   } catch (err) { next(err); }
 });
@@ -52,7 +62,10 @@ router.get('/stats', async (req, res, next) => {
 // GET /api/campaigns/:id
 router.get('/:id', async (req, res, next) => {
   try {
-    const result = await pool.query('SELECT * FROM campaigns WHERE id = $1', [req.params.id]);
+    const result = await pool.query(
+      'SELECT * FROM campaigns WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2)',
+      [req.params.id, orgParam(req)]
+    );
     if (!result.rows.length) return res.status(404).json({ error: 'Campaign not found' });
     res.json(result.rows[0]);
   } catch (err) { next(err); }
@@ -64,13 +77,13 @@ router.post('/', async (req, res, next) => {
     const { name, type, channel, audience, subject, goal, body, scheduled_at, start, end, sent_at, status } = req.body;
     if (!name) return res.status(400).json({ error: 'name is required' });
     const result = await pool.query(
-      `INSERT INTO campaigns (name, type, audience, subject, body, scheduled_at, sent_at, status, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO campaigns (name, type, audience, subject, body, scheduled_at, sent_at, status, created_by, organization_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING id, name, status, audience,
                  type AS channel, subject AS goal, scheduled_at AS start,
                  sent_at AS end, sent_count AS sent, open_count AS opened,
                  conversions AS converted, created_at`,
-      [name, type || channel || 'email', audience || 'all', subject || goal || null, body || null, scheduled_at || start || null, sent_at || end || null, status || 'draft', req.user?.id]
+      [name, type || channel || 'email', audience || 'all', subject || goal || null, body || null, scheduled_at || start || null, sent_at || end || null, status || 'draft', req.user?.id, orgParam(req)]
     );
     res.status(201).json({ campaign: result.rows[0] });
   } catch (err) { next(err); }
@@ -90,9 +103,9 @@ router.put('/:id', async (req, res, next) => {
            scheduled_at = $6,
            status = COALESCE($7, status),
            updated_at = NOW()
-       WHERE id = $8
+       WHERE id = $8 AND ($9::uuid IS NULL OR organization_id = $9)
        RETURNING *`,
-      [name, type, audience, subject, body, scheduled_at || null, status, req.params.id]
+      [name, type, audience, subject, body, scheduled_at || null, status, req.params.id, orgParam(req)]
     );
     if (!result.rows.length) return res.status(404).json({ error: 'Campaign not found' });
     res.json({ campaign: result.rows[0] });
@@ -102,7 +115,10 @@ router.put('/:id', async (req, res, next) => {
 // DELETE /api/campaigns/:id
 router.delete('/:id', async (req, res, next) => {
   try {
-    const result = await pool.query('DELETE FROM campaigns WHERE id = $1 RETURNING id', [req.params.id]);
+    const result = await pool.query(
+      'DELETE FROM campaigns WHERE id = $1 AND ($2::uuid IS NULL OR organization_id = $2) RETURNING id',
+      [req.params.id, orgParam(req)]
+    );
     if (!result.rows.length) return res.status(404).json({ error: 'Campaign not found' });
     res.json({ message: 'Campaign deleted' });
   } catch (err) { next(err); }

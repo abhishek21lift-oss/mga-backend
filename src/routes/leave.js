@@ -6,6 +6,7 @@ const router = require('express').Router();
 const pool = require('../db/pool');
 const logger = require('../lib/logger');
 const { auth, adminOrManager } = require('../middleware/auth');
+const { tenantScope } = require('../lib/tenant-db');
 
 // GET /api/leave — list leave requests
 // Filters: status, trainer_id, from, to
@@ -37,6 +38,13 @@ router.get('/', auth, async function(req, res) {
       conditions.push('lr.trainer_id = $' + idx++);
       const { rows: tr } = await pool.query('SELECT id FROM trainers WHERE id = $1 OR user_id = $1', [req.user.id]);
       params.push(tr.length ? tr[0].id : req.user.trainer_id || req.user.id);
+    } else {
+      // Admin/manager/reception: every studio's requests were previously
+      // visible to every other studio's admin here — scope to the caller's
+      // own org (null-safe for a platform super admin, who sees all).
+      const { applyFilter, orgId } = tenantScope(req);
+      conditions.push('($' + idx++ + '::uuid IS NULL OR lr.organization_id = $' + (idx - 1) + ')');
+      params.push(applyFilter ? orgId : null);
     }
 
     const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
@@ -85,12 +93,21 @@ router.get('/', auth, async function(req, res) {
 // GET /api/leave/:id — single leave request
 router.get('/:id', auth, async function(req, res) {
   try {
+    const { applyFilter, orgId } = tenantScope(req);
+    const conditions = ['lr.id = $1', '($2::uuid IS NULL OR lr.organization_id = $2)'];
+    const params = [req.params.id, applyFilter ? orgId : null];
+    if (req.user.role === 'trainer') {
+      const { rows: tr } = await pool.query('SELECT id FROM trainers WHERE id = $1 OR user_id = $1', [req.user.id]);
+      conditions.push('lr.trainer_id = $' + (params.length + 1));
+      params.push(tr.length ? tr[0].id : req.user.trainer_id || req.user.id);
+    }
+
     const { rows } = await pool.query(
       'SELECT lr.*, t.name AS trainer_name, t.email AS trainer_email ' +
       'FROM leave_requests lr ' +
       'LEFT JOIN trainers t ON t.id = lr.trainer_id ' +
-      'WHERE lr.id = $1',
-      [req.params.id]
+      'WHERE ' + conditions.join(' AND '),
+      params
     );
 
     if (!rows[0]) return res.status(404).json({ error: 'Leave request not found' });
@@ -150,6 +167,20 @@ router.post('/', auth, async function(req, res) {
       }
     }
 
+    // The leave request always belongs to whichever org the target trainer
+    // belongs to — resolved here rather than trusted from the caller, and
+    // checked against the caller's own org (unless they're a platform-wide
+    // super admin) so an admin cannot file leave against another studio's
+    // staff member by trainer_id alone.
+    const { applyFilter, orgId } = tenantScope(req);
+    const { rows: owner } = await pool.query(
+      'SELECT organization_id FROM trainers WHERE id = $1', [trainer_id]
+    );
+    if (!owner.length) return res.status(404).json({ error: 'Trainer not found' });
+    if (applyFilter && owner[0].organization_id !== orgId) {
+      return res.status(404).json({ error: 'Trainer not found' });
+    }
+
     // Check for overlapping pending leave
     const { rows: overlap } = await pool.query(
       'SELECT id FROM leave_requests WHERE trainer_id = $1 AND status = $2 ' +
@@ -162,10 +193,10 @@ router.post('/', auth, async function(req, res) {
     }
 
     const { rows } = await pool.query(
-      'INSERT INTO leave_requests (trainer_id, leave_type, from_date, to_date, reason) ' +
-      'VALUES ($1, $2, $3, $4, $5) ' +
+      'INSERT INTO leave_requests (trainer_id, leave_type, from_date, to_date, reason, organization_id) ' +
+      'VALUES ($1, $2, $3, $4, $5, $6) ' +
       'RETURNING *',
-      [trainer_id, leave_type || 'other', from_date, to_date, reason || '']
+      [trainer_id, leave_type || 'other', from_date, to_date, reason || '', owner[0].organization_id]
     );
 
     const r = rows[0];
@@ -191,11 +222,12 @@ router.post('/', auth, async function(req, res) {
 // POST /api/leave/:id/approve — approve leave
 router.post('/:id/approve', auth, adminOrManager, async function(req, res) {
   try {
+    const { applyFilter, orgId } = tenantScope(req);
     const { rows } = await pool.query(
       'UPDATE leave_requests SET status = $1, approved_by = $2, approved_at = NOW(), ' +
       'admin_note = COALESCE($3, admin_note), updated_at = NOW() ' +
-      'WHERE id = $4 AND status = $5 RETURNING *',
-      ['approved', req.user.id, req.body.admin_note || null, req.params.id, 'pending']
+      'WHERE id = $4 AND status = $5 AND ($6::uuid IS NULL OR organization_id = $6) RETURNING *',
+      ['approved', req.user.id, req.body.admin_note || null, req.params.id, 'pending', applyFilter ? orgId : null]
     );
 
     if (!rows[0]) {
@@ -212,11 +244,12 @@ router.post('/:id/approve', auth, adminOrManager, async function(req, res) {
 // POST /api/leave/:id/reject — reject leave
 router.post('/:id/reject', auth, adminOrManager, async function(req, res) {
   try {
+    const { applyFilter, orgId } = tenantScope(req);
     const { rows } = await pool.query(
       'UPDATE leave_requests SET status = $1, approved_by = $2, ' +
       'admin_note = COALESCE($3, admin_note), updated_at = NOW() ' +
-      'WHERE id = $4 AND status = $5 RETURNING *',
-      ['rejected', req.user.id, req.body.admin_note || null, req.params.id, 'pending']
+      'WHERE id = $4 AND status = $5 AND ($6::uuid IS NULL OR organization_id = $6) RETURNING *',
+      ['rejected', req.user.id, req.body.admin_note || null, req.params.id, 'pending', applyFilter ? orgId : null]
     );
 
     if (!rows[0]) {

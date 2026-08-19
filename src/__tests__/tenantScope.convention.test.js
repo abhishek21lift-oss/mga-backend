@@ -92,17 +92,6 @@ const REVIEWED_EXCEPTIONS = {
     'platform-wide COUNTs only (studios, trainers, active clients, sessions). ' +
     'Aggregates across all tenants is the intended behaviour; it returns no ' +
     'rows, no identifiers and no PII.',
-  'routes/classes.js':
-    'LEFT JOIN trainers ON t.id = cs.trainer_id — resolves a trainer name for ' +
-    'a class row that the surrounding query has already scoped. The join is on ' +
-    'a specific FK, not an open read of the trainers table.',
-  'routes/leave.js':
-    'Self-lookup (SELECT id FROM trainers WHERE id = $1 OR user_id = $1, keyed ' +
-    'on req.user.id) plus name-resolution joins on leave rows already scoped ' +
-    'to the caller.',
-  'modules/bookings/bookings.service.js':
-    'Name-resolution join only. Note this module targets the legacy ' +
-    'members/member_memberships tables that server.js documents as abandoned.',
   'modules/automation/automation.routes.js':
     'LEFT JOIN users u ON u.id = ar.created_by — resolves an author name for ' +
     'automation rows the surrounding query already filters. Join is on an FK.',
